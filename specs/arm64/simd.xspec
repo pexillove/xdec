@@ -73,6 +73,88 @@ fn sub_lanes(q: int(0..1), lane_bits: int, a: bits(64 << q), b: bits(64 << q))
   }
 }
 
+// Multiplication cannot be faked the way addition is: a product needs the
+// full width of its lane, so there is no spare bit to keep a carry out of the
+// neighbour. Each lane is written out. There is no 64-bit lane form of MUL to
+// cover, which is why the widths stop at 32.
+fn mul_lanes8_64(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(
+      concat(concat(extract(a, 56, 8) * extract(b, 56, 8),
+                    extract(a, 48, 8) * extract(b, 48, 8)),
+             concat(extract(a, 40, 8) * extract(b, 40, 8),
+                    extract(a, 32, 8) * extract(b, 32, 8))),
+      concat(concat(extract(a, 24, 8) * extract(b, 24, 8),
+                    extract(a, 16, 8) * extract(b, 16, 8)),
+             concat(extract(a, 8, 8) * extract(b, 8, 8),
+                    extract(a, 0, 8) * extract(b, 0, 8))));
+}
+
+fn mul_lanes16_64(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(
+      concat(extract(a, 48, 16) * extract(b, 48, 16),
+             extract(a, 32, 16) * extract(b, 32, 16)),
+      concat(extract(a, 16, 16) * extract(b, 16, 16),
+             extract(a, 0, 16) * extract(b, 0, 16)));
+}
+
+fn mul_lanes32_64(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(extract(a, 32, 32) * extract(b, 32, 32),
+                extract(a, 0, 32) * extract(b, 0, 32));
+}
+
+fn mul_lanes64(lane_bits: int, a: bits(64), b: bits(64)) -> bits(64) {
+  if lane_bits == 8 {
+    return mul_lanes8_64(a, b);
+  } else {
+    if lane_bits == 16 {
+      return mul_lanes16_64(a, b);
+    } else {
+      return mul_lanes32_64(a, b);
+    }
+  }
+}
+
+fn mul_lanes(q: int(0..1), lane_bits: int, a: bits(64 << q), b: bits(64 << q))
+    -> bits(64 << q) {
+  if q == 1 {
+    return concat(mul_lanes64(lane_bits, extract(a, 64, 64), extract(b, 64, 64)),
+                  mul_lanes64(lane_bits, extract(a, 0, 64), extract(b, 0, 64)));
+  } else {
+    return mul_lanes64(lane_bits, a, b);
+  }
+}
+
+// XTN keeps the low `lane_bits` of each double-width source element, packing
+// the 128-bit input down to 64 bits.
+fn xtn8_64(v: bits(128)) -> bits(64) {
+  return concat(
+      concat(concat(extract(v, 112, 8), extract(v, 96, 8)),
+             concat(extract(v, 80, 8), extract(v, 64, 8))),
+      concat(concat(extract(v, 48, 8), extract(v, 32, 8)),
+             concat(extract(v, 16, 8), extract(v, 0, 8))));
+}
+
+fn xtn16_64(v: bits(128)) -> bits(64) {
+  return concat(concat(extract(v, 96, 16), extract(v, 64, 16)),
+                concat(extract(v, 32, 16), extract(v, 0, 16)));
+}
+
+fn xtn32_64(v: bits(128)) -> bits(64) {
+  return concat(extract(v, 64, 32), extract(v, 0, 32));
+}
+
+fn xtn_narrow(lane_bits: int, v: bits(128)) -> bits(64) {
+  if lane_bits == 8 {
+    return xtn8_64(v);
+  } else {
+    if lane_bits == 16 {
+      return xtn16_64(v);
+    } else {
+      return xtn32_64(v);
+    }
+  }
+}
+
 fn shl_lanes64(lane_bits: int, v: bits(64), amount: int) -> bits(64) {
   let keep = imm(replicate_int(ones_int(lane_bits - amount), lane_bits, 64), 64);
   return (v & keep) << imm(amount, 64);
@@ -201,6 +283,38 @@ fn cmlt_8b(v: bits(64)) -> bits(64) {
              concat(cmlt8(extract(v, 8, 8)), cmlt8(extract(v, 0, 8)))));
 }
 
+fn cmeq0_32(v: bits(32)) -> bits(32) {
+  return select(v == imm(0, 32), imm(0xffffffff, 32), imm(0, 32));
+}
+
+fn cmeq0_4s(v: bits(128)) -> bits(128) {
+  return concat(
+      concat(cmeq0_32(extract(v, 96, 32)), cmeq0_32(extract(v, 64, 32))),
+      concat(cmeq0_32(extract(v, 32, 32)), cmeq0_32(extract(v, 0, 32))));
+}
+
+/// USHL takes its shift amount from the low signed byte of the control lane:
+/// positive shifts left, negative shifts right, and either direction clears
+/// the lane once the magnitude reaches the lane width. The magnitude is
+/// clamped before it reaches a shift operator so that an out-of-range amount
+/// never has to be well defined there.
+fn ushl32(v: bits(32), control: bits(32)) -> bits(32) {
+  let amount = sext(extract(control, 0, 8), 32);
+  let negative = amount < imm(0, 32);
+  let magnitude = select(negative, imm(0, 32) - amount, amount);
+  let inrange = magnitude <u imm(32, 32);
+  let safe = select(inrange, magnitude, imm(0, 32));
+  return select(inrange, select(negative, v >> safe, v << safe), imm(0, 32));
+}
+
+fn ushl_4s(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(
+      concat(ushl32(extract(a, 96, 32), extract(b, 96, 32)),
+             ushl32(extract(a, 64, 32), extract(b, 64, 32))),
+      concat(ushl32(extract(a, 32, 32), extract(b, 32, 32)),
+             ushl32(extract(a, 0, 32), extract(b, 0, 32))));
+}
+
 fn dup8_64(v: bits(8)) -> bits(64) {
   let pair = concat(v, v);
   let quad = concat(pair, pair);
@@ -214,6 +328,17 @@ fn dup16_64(v: bits(16)) -> bits(64) {
 
 fn dup32_64(v: bits(32)) -> bits(64) {
   return concat(v, v);
+}
+
+/// Writes a 64-bit pattern to a vector, doubled when the instruction is the
+/// full-width form. The narrow form zeroes the upper half, which is why this
+/// goes through `write_vec` rather than assigning the `d` view directly.
+fn write_dup64(n: int(0..31), q: int(0..1), half: bits(64)) {
+  if q == 1 {
+    write_vec(n, q, concat(half, half));
+  } else {
+    write_vec(n, q, half);
+  }
 }
 
 // Floating vector arithmetic is expanded lane-by-lane into the existing scalar
@@ -461,8 +586,16 @@ insn neon_fabs_2s_4s {
   encoding "0" Q:1 "001110" "10" "1" "00000" "111110" Rn:5 Rd:5
   asm "fabs {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}"
   semantics {
-    let width = 64 << Q;
-    write_vec(Rd, Q, read_vec(Rn, Q) & imm(replicate_int(0x7fffffff, 32, width), width));
+    // The mask is built one 64-bit half at a time for the reason given where
+    // write_dup64 is defined: an xspec integer is 64 bits, so asking
+    // replicate_int for a 128-bit mask silently yields a 64-bit one, and the
+    // zero-extension that follows would clear the lanes it was meant to keep.
+    let half = imm(replicate_int(0x7fffffff, 32, 64), 64);
+    if Q == 1 {
+      write_vec(Rd, 1, read_vec(Rn, 1) & concat(half, half));
+    } else {
+      write_vec(Rd, 0, read_vec(Rn, 0) & half);
+    }
   }
 }
 
@@ -470,8 +603,12 @@ insn neon_fneg_2s_4s {
   encoding "0" Q:1 "101110" "10" "1" "00000" "111110" Rn:5 Rd:5
   asm "fneg {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}"
   semantics {
-    let width = 64 << Q;
-    write_vec(Rd, Q, read_vec(Rn, Q) ^ imm(replicate_int(0x80000000, 32, width), width));
+    let half = imm(replicate_int(0x80000000, 32, 64), 64);
+    if Q == 1 {
+      write_vec(Rd, 1, read_vec(Rn, 1) ^ concat(half, half));
+    } else {
+      write_vec(Rd, 0, read_vec(Rn, 0) ^ half);
+    }
   }
 }
 
@@ -583,6 +720,67 @@ insn neon_add_lanes {
   asm "add {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
   semantics {
     write_vec(Rd, Q, add_lanes(Q, 8 << size, read_vec(Rn, Q), read_vec(Rm, Q)));
+  }
+}
+
+// XTN and XTN2 differ only in where the narrowed half lands: XTN writes the
+// low half and zeroes the rest, XTN2 writes the high half and leaves the low
+// half alone. The element arrangement has to appear literally in each
+// mnemonic, so the three source widths get a rule apiece.
+insn neon_xtn_8b {
+  encoding "0" "0" "0" "01110" "00" "10000" "10010" "10" Rn:5 Rd:5
+  asm "xtn {Rd:vreg(64)}.8b, {Rn:vreg(128)}.8h"
+  semantics {
+    write_vec(Rd, 0, xtn8_64(vec[Rn]));
+  }
+}
+
+insn neon_xtn_4h {
+  encoding "0" "0" "0" "01110" "01" "10000" "10010" "10" Rn:5 Rd:5
+  asm "xtn {Rd:vreg(64)}.4h, {Rn:vreg(128)}.4s"
+  semantics {
+    write_vec(Rd, 0, xtn16_64(vec[Rn]));
+  }
+}
+
+insn neon_xtn_2s {
+  encoding "0" "0" "0" "01110" "10" "10000" "10010" "10" Rn:5 Rd:5
+  asm "xtn {Rd:vreg(64)}.2s, {Rn:vreg(128)}.2d"
+  semantics {
+    write_vec(Rd, 0, xtn32_64(vec[Rn]));
+  }
+}
+
+insn neon_xtn2_16b {
+  encoding "0" "1" "0" "01110" "00" "10000" "10010" "10" Rn:5 Rd:5
+  asm "xtn2 {Rd:vreg(128)}.16b, {Rn:vreg(128)}.8h"
+  semantics {
+    vec[Rd] = concat(xtn8_64(vec[Rn]), extract(vec[Rd], 0, 64));
+  }
+}
+
+insn neon_xtn2_8h {
+  encoding "0" "1" "0" "01110" "01" "10000" "10010" "10" Rn:5 Rd:5
+  asm "xtn2 {Rd:vreg(128)}.8h, {Rn:vreg(128)}.4s"
+  semantics {
+    vec[Rd] = concat(xtn16_64(vec[Rn]), extract(vec[Rd], 0, 64));
+  }
+}
+
+insn neon_xtn2_4s {
+  encoding "0" "1" "0" "01110" "10" "10000" "10010" "10" Rn:5 Rd:5
+  asm "xtn2 {Rd:vreg(128)}.4s, {Rn:vreg(128)}.2d"
+  semantics {
+    vec[Rd] = concat(xtn32_64(vec[Rn]), extract(vec[Rd], 0, 64));
+  }
+}
+
+insn neon_mul_lanes {
+  encoding "0" Q:1 "001110" size:2 "1" Rm:5 "100111" Rn:5 Rd:5
+  require size != 3;
+  asm "mul {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, mul_lanes(Q, 8 << size, read_vec(Rn, Q), read_vec(Rm, Q)));
   }
 }
 
@@ -739,28 +937,166 @@ insn neon_movi_b {
   encoding "0" Q:1 "0" "01111" "00000" abc:3 "1110" "01" defgh:5 Rd:5
   asm "movi {Rd:vreg(64 << Q)}, #{(abc << 5) | defgh:hex}"
   semantics {
-    let byte = (abc << 5) | defgh;
-    let width = 64 << Q;
-    write_vec(Rd, Q, imm(replicate_int(byte, 8, width), width));
+    write_dup64(Rd, Q, dup8_64(imm((abc << 5) | defgh, 8)));
   }
 }
 
-// Modified-immediate 4S forms used for 32-bit lane constants.
-insn neon_movi_4s {
-  encoding "01001111" "00000" abc:3 "0000" "01" defgh:5 Rd:5
-  asm "movi {Rd:vreg(128)}, #{(abc << 5) | defgh:hex}"
+// The shifted modified-immediate forms. One imm8 is placed at one of four byte
+// positions within a 32-bit lane, or one of two within a 16-bit lane, and the
+// lane is then replicated across the register. `op` picks between MOVI and
+// MVNI, which differ only by inverting the lane, so they share a rule rather
+// than restating the placement twice.
+//
+// The whole constant is decode-time, so each of these lifts to a single
+// immediate no matter how elaborate the encoding was.
+
+// MOVI and MVNI differ only by inverting the lane, but they need separate
+// rules because the mnemonic is part of what a rule declares and the asm
+// syntax has no way to choose one from a field. The placement arithmetic is
+// stated once, in the writer helpers below.
+
+fn write_splat32(n: int(0..31), q: int(0..1), lane: bits(32)) {
+  write_dup64(n, q, dup32_64(lane));
+}
+
+fn write_splat16(n: int(0..31), q: int(0..1), lane: bits(16)) {
+  write_dup64(n, q, dup16_64(lane));
+}
+
+insn neon_movi_shifted_32 {
+  encoding "0" Q:1 "0" "0111100000" abc:3 "0" cc:2 "0" "0" "1" defgh:5 Rd:5
+  asm "movi {Rd:vreg(64 << Q)}.4s, #{(abc << 5) | defgh:hex}[, lsl #{cc * 8:dec}]"
   semantics {
-    let lane = imm((abc << 5) | defgh, 32);
-    vec[Rd] = concat(concat(lane, lane), concat(lane, lane));
+    write_splat32(Rd, Q, imm(((abc << 5) | defgh) << (cc * 8), 32));
   }
 }
 
-insn neon_mvni_4s {
-  encoding "01101111" "00000" abc:3 "0000" "01" defgh:5 Rd:5
-  asm "mvni {Rd:vreg(128)}, #{(abc << 5) | defgh:hex}"
+insn neon_mvni_shifted_32 {
+  encoding "0" Q:1 "1" "0111100000" abc:3 "0" cc:2 "0" "0" "1" defgh:5 Rd:5
+  asm "mvni {Rd:vreg(64 << Q)}.4s, #{(abc << 5) | defgh:hex}[, lsl #{cc * 8:dec}]"
   semantics {
-    let lane = ~imm((abc << 5) | defgh, 32);
-    vec[Rd] = concat(concat(lane, lane), concat(lane, lane));
+    write_splat32(Rd, Q, ~imm(((abc << 5) | defgh) << (cc * 8), 32));
+  }
+}
+
+insn neon_movi_shifted_16 {
+  encoding "0" Q:1 "0" "0111100000" abc:3 "10" c:1 "0" "0" "1" defgh:5 Rd:5
+  asm "movi {Rd:vreg(64 << Q)}.8h, #{(abc << 5) | defgh:hex}[, lsl #{c * 8:dec}]"
+  semantics {
+    write_splat16(Rd, Q, imm((((abc << 5) | defgh) << (c * 8)) & 0xffff, 16));
+  }
+}
+
+insn neon_mvni_shifted_16 {
+  encoding "0" Q:1 "1" "0111100000" abc:3 "10" c:1 "0" "0" "1" defgh:5 Rd:5
+  asm "mvni {Rd:vreg(64 << Q)}.8h, #{(abc << 5) | defgh:hex}[, lsl #{c * 8:dec}]"
+  semantics {
+    write_splat16(Rd, Q, ~imm((((abc << 5) | defgh) << (c * 8)) & 0xffff, 16));
+  }
+}
+
+// The "shifting ones" form: the imm8 moves up by one or two bytes and the
+// vacated low bits come in as ones rather than zeros. It exists because the
+// constants it builds -- a run of ones ending at a byte boundary -- are what
+// masking and saturating code actually wants.
+insn neon_movi_msl_32 {
+  encoding "0" Q:1 "0" "0111100000" abc:3 "110" c:1 "0" "1" defgh:5 Rd:5
+  asm "movi {Rd:vreg(64 << Q)}.4s, #{(abc << 5) | defgh:hex}, msl #{8 << c:dec}"
+  semantics {
+    write_splat32(Rd, Q,
+                  imm((((abc << 5) | defgh) << (8 << c)) | ones_int(8 << c),
+                      32));
+  }
+}
+
+insn neon_mvni_msl_32 {
+  encoding "0" Q:1 "1" "0111100000" abc:3 "110" c:1 "0" "1" defgh:5 Rd:5
+  asm "mvni {Rd:vreg(64 << Q)}.4s, #{(abc << 5) | defgh:hex}, msl #{8 << c:dec}"
+  semantics {
+    write_splat32(Rd, Q,
+                  ~imm((((abc << 5) | defgh) << (8 << c)) | ones_int(8 << c),
+                       32));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD copy: DUP by element, UMOV
+// ---------------------------------------------------------------------------
+//
+// These share one encoding whose `imm5` field names both the element size and
+// the lane, by the position of its lowest set bit. Rather than decode that
+// position arithmetically, each size writes the pattern into its own encoding:
+// the lane index then arrives as a field of the right width and is provably in
+// range, which a computed bit-scan would not be.
+
+insn neon_dup_elem_b {
+  encoding "0" Q:1 "0" "01110000" idx:4 "1" "0" "0000" "1" Rn:5 Rd:5
+  asm "dup {Rd:vreg(64 << Q)}.b, {Rn:vreg(128)}.b[{idx:dec}]"
+  semantics {
+    write_dup64(Rd, Q, dup8_64(extract(vec[Rn], idx * 8, 8)));
+  }
+}
+
+insn neon_dup_elem_h {
+  encoding "0" Q:1 "0" "01110000" idx:3 "10" "0" "0000" "1" Rn:5 Rd:5
+  asm "dup {Rd:vreg(64 << Q)}.h, {Rn:vreg(128)}.h[{idx:dec}]"
+  semantics {
+    write_dup64(Rd, Q, dup16_64(extract(vec[Rn], idx * 16, 16)));
+  }
+}
+
+insn neon_dup_elem_s {
+  encoding "0" Q:1 "0" "01110000" idx:2 "100" "0" "0000" "1" Rn:5 Rd:5
+  asm "dup {Rd:vreg(64 << Q)}.s, {Rn:vreg(128)}.s[{idx:dec}]"
+  semantics {
+    write_dup64(Rd, Q, dup32_64(extract(vec[Rn], idx * 32, 32)));
+  }
+}
+
+// Only the full-width form exists: replicating a 64-bit lane into a 64-bit
+// register would be a plain move, and the architecture leaves Q clear here
+// unallocated rather than spelling one.
+insn neon_dup_elem_d {
+  encoding "01" "0" "01110000" idx:1 "1000" "0" "0000" "1" Rn:5 Rd:5
+  asm "dup {Rd:vreg(128)}.d, {Rn:vreg(128)}.d[{idx:dec}]"
+  semantics {
+    let lane = extract(vec[Rn], idx * 64, 64);
+    vec[Rd] = concat(lane, lane);
+  }
+}
+
+// UMOV moves one lane into a general register, zero-extended. The destination
+// width is fixed by the element: everything below 64 bits lands in a W
+// register, and only the D form uses an X.
+insn neon_umov_b {
+  encoding "00" "0" "01110000" idx:4 "1" "0" "0111" "1" Rn:5 Rd:5
+  asm "umov {Rd:reg(0)}, {Rn:vreg(128)}.b[{idx:dec}]"
+  semantics {
+    write_gpr(Rd, 0, zext(extract(vec[Rn], idx * 8, 8), 32));
+  }
+}
+
+insn neon_umov_h {
+  encoding "00" "0" "01110000" idx:3 "10" "0" "0111" "1" Rn:5 Rd:5
+  asm "umov {Rd:reg(0)}, {Rn:vreg(128)}.h[{idx:dec}]"
+  semantics {
+    write_gpr(Rd, 0, zext(extract(vec[Rn], idx * 16, 16), 32));
+  }
+}
+
+insn neon_umov_s {
+  encoding "00" "0" "01110000" idx:2 "100" "0" "0111" "1" Rn:5 Rd:5
+  asm "umov {Rd:reg(0)}, {Rn:vreg(128)}.s[{idx:dec}]"
+  semantics {
+    write_gpr(Rd, 0, extract(vec[Rn], idx * 32, 32));
+  }
+}
+
+insn neon_umov_d {
+  encoding "01" "0" "01110000" idx:1 "1000" "0" "0111" "1" Rn:5 Rd:5
+  asm "umov {Rd:reg(1)}, {Rn:vreg(128)}.d[{idx:dec}]"
+  semantics {
+    write_gpr(Rd, 1, extract(vec[Rn], idx * 64, 64));
   }
 }
 
@@ -814,20 +1150,31 @@ insn neon_mov_s1_s0 {
   }
 }
 
-insn neon_umov_b15 {
-  encoding "00001110" "00011111" "001111" Rn:5 Rd:5
-  asm "umov {Rd:reg(0)}, {Rn:vreg(128)}.b15"
+// EXT reads a window of the two sources laid end to end: `imm4` bytes are
+// dropped off the bottom of Vn and the same number taken from the bottom of
+// Vm to refill the top. The two slices therefore always add back to the
+// register width, which is what the checker has to be shown.
+//
+// `imm4 == 0` is excluded because it would ask for a zero-width slice of Vm.
+// It is also the one value with no shuffling to do, and the assembler spells
+// it `mov` instead.
+insn neon_ext_16b {
+  encoding "01" "101110" "000" Rm:5 "0" imm4:4 "0" Rn:5 Rd:5
+  require imm4 != 0;
+  asm "ext {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}, #{imm4:dec}"
   semantics {
-    write_gpr(Rd, 0, zext(extract(vec[Rn], 120, 8), 32));
+    vec[Rd] = concat(extract(vec[Rm], 0, imm4 * 8),
+                     extract(vec[Rn], imm4 * 8, 128 - imm4 * 8));
   }
 }
 
-insn neon_ext_16b_8 {
-  encoding "01" "101110" "000" Rm:5 "0" "1000" "0" Rn:5 Rd:5
-  asm "ext {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}, #8"
+insn neon_ext_8b {
+  encoding "00" "101110" "000" Rm:5 "0" "0" imm3:3 "0" Rn:5 Rd:5
+  require imm3 != 0;
+  asm "ext {Rd:vreg(64)}, {Rn:vreg(64)}, {Rm:vreg(64)}, #{imm3:dec}"
   semantics {
-    vec[Rd] = concat(extract(vec[Rm], 0, 64),
-                     extract(vec[Rn], 64, 64));
+    vec[Rd].d = concat(extract(vec[Rm], 0, imm3 * 8),
+                       extract(vec[Rn], imm3 * 8, 64 - imm3 * 8));
   }
 }
 
@@ -866,6 +1213,133 @@ insn neon_uaddlv_8b {
             + zext(extract(src, 32, 8), 16) + zext(extract(src, 40, 8), 16)
             + zext(extract(src, 48, 8), 16) + zext(extract(src, 56, 8), 16);
     vec[Rd].h = sum;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Encodings found by decoding every instruction word in a shipping arm64
+// binary and diffing against this spec. Each one below was reached by real
+// code, so the catch-all was turning a working trace into a dead end.
+// ---------------------------------------------------------------------------
+
+// DUP (general) completes the byte/halfword/word family already above. The
+// 64-bit element size has no narrow form: imm5 `01000` only pairs with Q=1.
+insn neon_dup_gpr_d {
+  encoding "01" "001110" "000" "01000" "000011" Rn:5 Rd:5
+  asm "dup {Rd:vreg(128)}, {Rn:reg(1)}"
+  semantics {
+    let half = read_gpr(Rn, 1);
+    vec[Rd] = concat(half, half);
+  }
+}
+
+// INS (element), 64-bit lanes. imm5 is `x1000` with the destination index in
+// the top bit, and imm4 is `x000` with the source index in its top bit.
+insn neon_ins_elem_d {
+  encoding "01101110" "000" idxd:1 "1000" "0" idxn:1 "000" "1" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.d{idxd:dec}, {Rn:vreg(128)}.d{idxn:dec}"
+  semantics {
+    let src = extract(vec[Rn], idxn * 64, 64);
+    if idxd == 1 {
+      vec[Rd] = concat(src, extract(vec[Rd], 0, 64));
+    } else {
+      vec[Rd] = concat(extract(vec[Rd], 64, 64), src);
+    }
+  }
+}
+
+// INS (general), 32-bit lanes: imm5 is `idx:100`. The destination lane is
+// field-dependent and the other three lanes survive, so the vector is taken
+// apart and put back together rather than masked.
+insn neon_ins_gpr_s {
+  encoding "01001110" "000" idx:2 "100" "000111" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.s{idx:dec}, {Rn:reg(0)}"
+  semantics {
+    let src = read_gpr(Rn, 0);
+    let l0 = extract(vec[Rd], 0, 32);
+    let l1 = extract(vec[Rd], 32, 32);
+    let l2 = extract(vec[Rd], 64, 32);
+    let l3 = extract(vec[Rd], 96, 32);
+    if idx == 0 {
+      vec[Rd] = concat(concat(l3, l2), concat(l1, src));
+    } else if idx == 1 {
+      vec[Rd] = concat(concat(l3, l2), concat(src, l0));
+    } else if idx == 2 {
+      vec[Rd] = concat(concat(l3, src), concat(l1, l0));
+    } else {
+      vec[Rd] = concat(concat(src, l2), concat(l1, l0));
+    }
+  }
+}
+
+insn neon_cmeq_zero_4s {
+  encoding "01" "001110" "10" "10000" "01001" "10" Rn:5 Rd:5
+  asm "cmeq {Rd:vreg(128)}, {Rn:vreg(128)}, #0"
+  semantics {
+    vec[Rd] = cmeq0_4s(vec[Rn]);
+  }
+}
+
+// REV64 with 32-bit elements swaps the two words inside each doubleword. The
+// narrow form has only one doubleword, which is the whole instruction.
+insn neon_rev64_2s {
+  encoding "00" "001110" "10" "10000" "00000" "10" Rn:5 Rd:5
+  asm "rev64 {Rd:vreg(64)}, {Rn:vreg(64)}"
+  semantics {
+    write_vec(Rd, 0, concat(extract(vec[Rn], 0, 32), extract(vec[Rn], 32, 32)));
+  }
+}
+
+insn neon_ushl_4s {
+  encoding "01" "101110" "10" "1" Rm:5 "010001" Rn:5 Rd:5
+  asm "ushl {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
+  semantics {
+    vec[Rd] = ushl_4s(vec[Rn], vec[Rm]);
+  }
+}
+
+insn neon_neg_4s {
+  encoding "01" "101110" "10" "10000" "01011" "10" Rn:5 Rd:5
+  asm "neg {Rd:vreg(128)}, {Rn:vreg(128)}"
+  semantics {
+    vec[Rd] = sub_lanes(1, 32, zext(imm(0, 32), 128), vec[Rn]);
+  }
+}
+
+insn neon_mla_4s {
+  encoding "01" "001110" "10" "1" Rm:5 "100101" Rn:5 Rd:5
+  asm "mla {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
+  semantics {
+    vec[Rd] = add_lanes(1, 32, vec[Rd], mul_lanes(1, 32, vec[Rn], vec[Rm]));
+  }
+}
+
+// ORR and BIC by immediate share the MOVI encoding space; `op` picks between
+// them and the immediate is splatted across lanes the same way. Unlike MOVI
+// they read the destination, so they cannot go through write_splat*.
+insn neon_orr_imm_16 {
+  encoding "0" Q:1 "0" "0111100000" abc:3 "10" c:1 "1" "0" "1" defgh:5 Rd:5
+  asm "orr {Rd:vreg(64 << Q)}.8h, #{(abc << 5) | defgh:hex}[, lsl #{c * 8:dec}]"
+  semantics {
+    let half = dup16_64(imm((((abc << 5) | defgh) << (c * 8)) & 0xffff, 16));
+    if Q == 1 {
+      vec[Rd] = vec[Rd] | concat(half, half);
+    } else {
+      write_vec(Rd, 0, vec[Rd].d | half);
+    }
+  }
+}
+
+insn neon_bic_imm_32 {
+  encoding "0" Q:1 "1" "0111100000" abc:3 "0" cc:2 "1" "0" "1" defgh:5 Rd:5
+  asm "bic {Rd:vreg(64 << Q)}.4s, #{(abc << 5) | defgh:hex}[, lsl #{cc * 8:dec}]"
+  semantics {
+    let half = dup32_64(~imm(((abc << 5) | defgh) << (cc * 8), 32));
+    if Q == 1 {
+      vec[Rd] = vec[Rd] & concat(half, half);
+    } else {
+      write_vec(Rd, 0, vec[Rd].d & half);
+    }
   }
 }
 

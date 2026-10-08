@@ -3,6 +3,7 @@
 #include "xdec/passes/resolve_call.h"
 
 #include <format>
+
 #include <optional>
 #include <span>
 #include <string>

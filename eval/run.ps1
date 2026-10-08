@@ -106,7 +106,13 @@ foreach ($case in $cases) {
   $cliArgs += $case.Extra
   Write-Host "  $($case.Name) @ $addr"
   $sw = [Diagnostics.Stopwatch]::StartNew()
+  # Status and warnings go to stderr; under ErrorActionPreference=Stop merging
+  # them would turn the first one into a terminating error. The exit code is
+  # the verdict here.
+  $prevPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
   $output = & $Xdec decompile @cliArgs 2>&1
+  $ErrorActionPreference = $prevPreference
   $sw.Stop()
   Add-Content $Log "$($case.Name) $addr exit=$LASTEXITCODE time=$([int]$sw.Elapsed.TotalSeconds)s args=$($case.Extra -join ' ')"
   if ($LASTEXITCODE -ne 0) {

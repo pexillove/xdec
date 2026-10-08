@@ -15,18 +15,23 @@ list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
 include(Catch)
 
 add_executable(xdec_tests
+  obs/test_log.cpp
+  obs/test_span_job.cpp
   support/test_bits.cpp
   support/test_arena.cpp
   support/test_composite_reader.cpp
   support/test_handle.cpp
   support/test_result.cpp
+  storage/test_tracedb.cpp
   analysis/test_analysis.cpp
   analysis/test_analysis_cache.cpp
+  analysis/test_address_expr.cpp
   analysis/test_dispatch_region.cpp
   analysis/test_dispatch_values.cpp
   analysis/test_dispatcher_shape.cpp
   analysis/test_emit_redundancy.cpp
   analysis/test_entry_reg.cpp
+  analysis/test_execution_coverage.cpp
   analysis/test_expr_reuse.cpp
   analysis/test_guard_cascade.cpp
   analysis/test_image_eval.cpp
@@ -84,6 +89,7 @@ add_executable(xdec_tests
   binary/test_elf.cpp
   binary/test_macho.cpp
   binary/test_dyld_cache.cpp
+  binary/test_target_profile.cpp
   il/test_type.cpp
   il/test_expr.cpp
   il/test_function.cpp
@@ -168,6 +174,7 @@ target_link_libraries(xdec_tests PRIVATE
   xdec_passes
   xdec_plugin
   xdec_spec
+  xdec_storage
   xdec_types
   xdec_support
   xdec_warnings

@@ -7,6 +7,7 @@
 
 #include "xdec/analysis/dispatcher_shape.h"
 #include "xdec/analysis/live_register_frame.h"
+#include "xdec/analysis/stack_store_fold.h"
 
 namespace xdec::analysis {
 
@@ -58,9 +59,9 @@ struct DispatcherRelayStats {
 std::string EmitRedundancyReport::format() const {
   std::string text = std::format(
       "stack loads: {}/{} folded, memory loads: {}/{} folded, stack stores: {}/{} dead, "
-      "{} write-only local(s)",
+      "{} write-only local(s), {} redundant cast(s)",
       stackLoadsFolded, stackLoads, memoryLoadsFolded, memoryLoads, stackStoresDead, stackStores,
-      writeOnlyLocals);
+      writeOnlyLocals, redundantCasts);
   if (dispatcherRelaySlots.has_value()) {
     text += std::format(", dispatcher relay: {}/{} slot(s) unanimous passthrough",
                         dispatcherRelayUnneededSlots.value_or(0), *dispatcherRelaySlots);
@@ -124,6 +125,34 @@ EmitRedundancyPrep prepareEmitRedundancy(const il::Function& function, const Sta
 EmitRedundancyReport analyzeEmitRedundancy(const il::Function& function, const StackFrame& frame,
                                            const VariableTable& variables) {
   EmitRedundancyReport report;
+
+  for (const il::ExprId id : function.exprHandles()) {
+    const il::Expr& expr = function.expr(id);
+    if ((expr.op == il::ExprOp::ZExt || expr.op == il::ExprOp::Trunc ||
+         expr.op == il::ExprOp::Bitcast) &&
+        expr.operandCount == 1) {
+      const il::Expr& source = function.expr(expr.operand(0));
+      report.redundantCasts +=
+          source.type.isScalarInteger() && expr.type.isScalarInteger() &&
+          source.type.bits() == expr.type.bits();
+    }
+    if ((expr.op != il::ExprOp::CmpEq && expr.op != il::ExprOp::CmpNe) ||
+        expr.operandCount != 2) {
+      continue;
+    }
+    for (unsigned side = 0; side < 2; ++side) {
+      const il::Expr& widened = function.expr(expr.operand(side));
+      const il::Expr& constant = function.expr(expr.operand(1 - side));
+      if (widened.op != il::ExprOp::ZExt || constant.op != il::ExprOp::Const) {
+        continue;
+      }
+      const il::Expr& source = function.expr(widened.operand(0));
+      const uint32_t bits = source.type.isScalarInteger() ? source.type.bits() : 0;
+      if (bits >= 64 || (bits != 0 && constant.immediate < (uint64_t{1} << bits))) {
+        ++report.redundantCasts;
+      }
+    }
+  }
 
   std::unordered_set<int64_t> readDeltas;
   for (const il::BlockId blockId : function.blockHandles()) {

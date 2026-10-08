@@ -258,6 +258,15 @@ insn ldrsb64_reg_offset {
   }
 }
 
+insn ldrsb32_reg_offset {
+  encoding "00111000111" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "ldrsb {Rt:reg(0)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}]\]"
+  semantics {
+    write_gpr(Rt, 0, sext(load(read_gpr_sp(Rn, 1) + extend_reg(1, Rm, option, 0), 8), 32));
+  }
+}
+
 insn ldrsh64_reg_offset {
   encoding "01111000101" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
   require option == 2 || option == 3 || option == 6 || option == 7;
@@ -544,6 +553,17 @@ insn ldr_literal {
   }
 }
 
+// LDRSW has no size bit to share with LDR: the sign extension is what the
+// opcode means, so it gets its own literal form.
+insn ldrsw_literal {
+  encoding "10011000" imm19:19 Rt:5
+  asm "ldrsw {Rt:reg(1)}, #{insn_pc + (sextint(imm19, 19) << 2):hex}"
+  semantics {
+    write_gpr(Rt, 1,
+              sext(load(imm(insn_pc + (sextint(imm19, 19) << 2), 64), 32), 64));
+  }
+}
+
 insn stp_offset {
   encoding sz:1 "010100100" imm7:7 Rt2:5 Rn:5 Rt:5
   asm "stp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + sz):dec}\]"
@@ -732,6 +752,128 @@ insn stlxrb {
     intrinsic("aarch64.release");
     store(read_gpr_sp(Rn, 1), trunc(read_gpr(Rt, 0), 8));
     write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
+// The rest of the narrow exclusive matrix. Byte and halfword each come in
+// four flavours -- load or store, with or without the acquire/release bit --
+// and only two of the eight were spelled out before.
+
+insn stxrb {
+  encoding "00001000000" Rs:5 "011111" Rn:5 Rt:5
+  asm "stxrb {Rs:reg(0)}, {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1), trunc(read_gpr(Rt, 0), 8));
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
+insn stlxrh {
+  encoding "01001000000" Rs:5 "111111" Rn:5 Rt:5
+  asm "stlxrh {Rs:reg(0)}, {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.release");
+    store(read_gpr_sp(Rn, 1), trunc(read_gpr(Rt, 0), 16));
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
+insn stxrh {
+  encoding "01001000000" Rs:5 "011111" Rn:5 Rt:5
+  asm "stxrh {Rs:reg(0)}, {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1), trunc(read_gpr(Rt, 0), 16));
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
+insn ldxrb {
+  encoding "0000100001011111011111" Rn:5 Rt:5
+  asm "ldxrb {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.reserve", read_gpr_sp(Rn, 1));
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1), 8), 32));
+  }
+}
+
+insn ldaxrh {
+  encoding "0100100001011111111111" Rn:5 Rt:5
+  asm "ldaxrh {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.reserve", read_gpr_sp(Rn, 1));
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1), 16), 32));
+    intrinsic("aarch64.acquire");
+  }
+}
+
+insn ldxrh {
+  encoding "0100100001011111011111" Rn:5 Rt:5
+  asm "ldxrh {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.reserve", read_gpr_sp(Rn, 1));
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1), 16), 32));
+  }
+}
+
+// The pair forms reserve one region and move two registers through it. Rs is
+// architecturally 11111 on the loads; leaving it as a literal keeps words that
+// merely look like LDXP from being claimed as instructions.
+
+insn ldxp {
+  encoding "1" sz:1 "00100001111111" "0" Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  asm "ldxp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    intrinsic("aarch64.reserve", base);
+    write_gpr(Rt, sz, load(base, 32 << sz));
+    write_gpr(Rt2, sz, load(base + imm(4 << sz, 64), 32 << sz));
+  }
+}
+
+insn ldaxp {
+  encoding "1" sz:1 "00100001111111" "1" Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  asm "ldaxp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    intrinsic("aarch64.reserve", base);
+    write_gpr(Rt, sz, load(base, 32 << sz));
+    write_gpr(Rt2, sz, load(base + imm(4 << sz, 64), 32 << sz));
+    intrinsic("aarch64.acquire");
+  }
+}
+
+insn stxp {
+  encoding "1" sz:1 "001000001" Rs:5 "0" Rt2:5 Rn:5 Rt:5
+  asm "stxp {Rs:reg(0)}, {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, read_gpr(Rt, sz));
+    store(base + imm(4 << sz, 64), read_gpr(Rt2, sz));
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
+insn stlxp {
+  encoding "1" sz:1 "001000001" Rs:5 "1" Rt2:5 Rn:5 Rt:5
+  asm "stlxp {Rs:reg(0)}, {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    intrinsic("aarch64.release");
+    store(base, read_gpr(Rt, sz));
+    store(base + imm(4 << sz, 64), read_gpr(Rt2, sz));
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
+// PRFM is a hint. It has no effect on any state this IL models, and the
+// prefetch target is held in the Rt field as an opcode rather than a register.
+insn prfm_literal {
+  encoding "11011000" imm19:19 prfop:5
+  asm "prfm #{prfop:hex}, #{insn_pc + (sextint(imm19, 19) << 2):hex}"
+  semantics {
+    nop();
   }
 }
 

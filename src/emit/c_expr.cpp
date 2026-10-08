@@ -78,6 +78,35 @@ std::string ExprPrinter::rootInteger(il::ExprId id) {
   return integerOperand(id);
 }
 
+std::string ExprPrinter::condition(il::ExprId id, bool invert) {
+  if (!invert) {
+    return rootText(id);
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  switch (expr.op) {
+    case il::ExprOp::CmpEq:
+      return compare(id, "!=", false);
+    case il::ExprOp::CmpNe:
+      return compare(id, "==", false);
+    case il::ExprOp::CmpLtU:
+      return compare(id, ">=", false);
+    case il::ExprOp::CmpLeU:
+      return compare(id, ">", false);
+    case il::ExprOp::CmpLtS:
+      return compare(id, ">=", true);
+    case il::ExprOp::CmpLeS:
+      return compare(id, ">", true);
+    case il::ExprOp::Not:
+      if (expr.type.bits() == 1) {
+        return rootText(expr.operand(0));
+      }
+      break;
+    default:
+      break;
+  }
+  return std::format("!({})", rootText(id));
+}
+
 void ExprPrinter::beginScope(const std::vector<il::ExprId>& roots) {
   referenceCounts_.clear();
   materializedText_.clear();
@@ -134,7 +163,7 @@ ExprPrinter::Text ExprPrinter::value(il::ExprId id) {
           return {std::format("(*({}*)({}))", intType(width), *global), false};
         }
       }
-      return {std::format("(*({}*)({}))", intType(width), rootInteger(address)), false};
+      return {std::format("(*{})", pointerOperand(address, width)), false};
     }
     // A load a header typed: named through tempNames, and declared as the
     // pointer the field is, so arithmetic on it needs the cast back.
@@ -170,17 +199,30 @@ ExprPrinter::Text ExprPrinter::value(il::ExprId id) {
 void ExprPrinter::countReferences(il::ExprId root) {
   std::vector<il::ExprId> stack{root};
   ++referenceCounts_[root.index()];
+  const auto visit = [&](il::ExprId child) {
+    const bool first = referenceCounts_.find(child.index()) == referenceCounts_.end();
+    ++referenceCounts_[child.index()];
+    if (first) {
+      stack.push_back(child);
+    }
+  };
   while (!stack.empty()) {
     const il::ExprId id = stack.back();
     stack.pop_back();
     const il::Expr& expr = ctx_.function.expr(id);
-    for (unsigned index = 0; index < expr.operandCount; ++index) {
-      const il::ExprId child = expr.operand(index);
-      const bool first = referenceCounts_.find(child.index()) == referenceCounts_.end();
-      ++referenceCounts_[child.index()];
-      if (first) {
-        stack.push_back(child);
+    // An inlined load prints its address in place of the value (see value()),
+    // and that address belongs to a dead op no scope's roots include. Left
+    // uncounted, every node in it reads as unshared and prints as a tree.
+    if (expr.op == il::ExprOp::Value) {
+      if (const auto inlined =
+              ctx_.inlinedMemoryLoads.find(static_cast<uint32_t>(expr.immediate));
+          inlined != ctx_.inlinedMemoryLoads.end()) {
+        visit(inlined->second.address);
       }
+      continue;
+    }
+    for (unsigned index = 0; index < expr.operandCount; ++index) {
+      visit(expr.operand(index));
     }
   }
 }
@@ -208,6 +250,11 @@ ExprPrinter::Text ExprPrinter::materialized(il::ExprId id) {
     return cached->second;
   }
   const il::Expr& expr = ctx_.function.expr(id);
+  if (expr.operandCount != 0 && !referenceCounts_.contains(id.index())) {
+    // Reached from outside every root the scope counted: count it now, or its
+    // shared subtrees would all read as unshared and print as a tree.
+    countReferences(id);
+  }
   if (!isShared(id, expr)) {
     return Text{inner(id), false};
   }
@@ -216,11 +263,20 @@ ExprPrinter::Text ExprPrinter::materialized(il::ExprId id) {
   // a leading ZExt cast here is exactly the redundant-root case `rootText`
   // documents, since this assignment is the same kind of conversion.
   const std::string name = std::format("_cse{}", cseCounter_++);
-  ctx_.cseTemps.emplace_back(name, expr.type.bits());
-  const std::string initializer =
-      isRedundantRootZext(expr) ? integerOperand(expr.operand(0)) : inner(id);
+  bool pointer = false;
+  std::string initializer;
+  if (const auto rendered =
+          AddressRenderer(ctx_).render(id, AddressRole::PointerValue, 8);
+      rendered.has_value() && rendered->pointer) {
+    pointer = true;
+    initializer = rendered->text;
+  } else {
+    initializer =
+        isRedundantRootZext(expr) ? integerOperand(expr.operand(0)) : inner(id);
+  }
+  ctx_.cseTemps.push_back(CseTemp{name, expr.type.bits(), pointer});
   pendingDecls_.push_back(std::format("{} = {};", name, initializer));
-  const Text result{name, false};
+  const Text result{name, pointer};
   materializedText_.emplace(id.index(), result);
   return result;
 }
@@ -261,10 +317,10 @@ std::string ExprPrinter::inner(il::ExprId id) {
       if (const std::string* temp = ctx_.tempFor(valueId)) {
         return *temp;
       }
-      return std::format("/*unnamed-value-%{}*/0", valueId.index());
+      return std::format("/*unnamed-value-%{}*/0x0", valueId.index());
     }
     case il::ExprOp::Undef:
-      return "/*undef*/0";
+      return "/*undef*/0x0";
     case il::ExprOp::EntryReg: {
       const il::RegId root{static_cast<uint32_t>(e.immediate)};
       if (const analysis::Variable* arg = ctx_.variables.argumentFor(root)) {
@@ -354,7 +410,7 @@ std::string ExprPrinter::inner(il::ExprId id) {
       // operand(0) is the high half, operand(1) the low half (see ceval's
       // Concat case): result = hi << lowWidth | lo.
       const uint32_t lowWidth = ctx_.function.expr(e.operand(1)).type.bits();
-      return std::format("((({})({}) << {}) | ({})({}))", intType(e.type.bits()),
+      return std::format("((({})({}) << 0x{:x}) | ({})({}))", intType(e.type.bits()),
                          integerOperand(e.operand(0)), lowWidth,
                          intType(e.type.bits()), integerOperand(e.operand(1)));
     }
@@ -424,7 +480,7 @@ std::string ExprPrinter::inner(il::ExprId id) {
         return std::format("(({})({}))", intType(width),
                            integerOperand(e.operand(0)));
       }
-      return std::format("(({})({} >> {}))", intType(width),
+      return std::format("(({})({} >> 0x{:x}))", intType(width),
                          integerOperand(e.operand(0)), e.immediate);
     }
     case il::ExprOp::ByteSwap:
@@ -446,10 +502,10 @@ std::string ExprPrinter::inner(il::ExprId id) {
       return printFlagCond(ctx_, *this, id);
     case il::ExprOp::FlagBit:
       ctx_.helpers.insert("flagbit");
-      return std::format("xdec_flagbit({}, {})", text(e.operand(0)), e.immediate);
+      return std::format("xdec_flagbit({}, 0x{:x})", text(e.operand(0)), e.immediate);
     case il::ExprOp::FlagDef:
       // Only meaningful under a FlagCond or FlagBit; alone it says nothing.
-      return "/*flagdef*/0";
+      return "/*flagdef*/0x0";
     case il::ExprOp::FAdd:
     case il::ExprOp::FSub:
     case il::ExprOp::FMul:
@@ -465,7 +521,7 @@ std::string ExprPrinter::inner(il::ExprId id) {
       return call + ")";
     }
     default:
-      return std::format("/*{}?*/0", il::toString(e.op));
+      return std::format("/*{}?*/0x0", il::toString(e.op));
   }
 }
 
@@ -501,16 +557,16 @@ std::string ExprPrinter::shift(il::ExprId id, std::string_view op) {
       e, std::format("({} {} {})", left, op, integerOperand(e.operand(1))), false);
 }
 
-namespace {
-[[nodiscard]] bool isZeroConstant(const il::Expr& expr) {
-  return expr.op == il::ExprOp::Const && expr.immediate == 0;
-}
-}  // namespace
-
-std::string ExprPrinter::equalityOperand(il::ExprId id, bool comparedToZero) {
+std::string ExprPrinter::equalityOperand(
+    il::ExprId id, std::optional<uint64_t> comparedConstant) {
   const il::Expr& expr = ctx_.function.expr(id);
-  if (comparedToZero && expr.op == il::ExprOp::ZExt) {
-    return integerOperand(expr.operand(0));
+  if (comparedConstant.has_value() && expr.op == il::ExprOp::ZExt) {
+    const il::Expr& source = ctx_.function.expr(expr.operand(0));
+    const uint32_t bits = source.type.isScalarInteger() ? source.type.bits() : 0;
+    const bool fits = bits >= 64 || (bits != 0 && *comparedConstant < (uint64_t{1} << bits));
+    if (fits) {
+      return integerOperand(expr.operand(0));
+    }
   }
   return integerOperand(id);
 }
@@ -522,10 +578,19 @@ std::string ExprPrinter::compare(il::ExprId id, std::string_view op, bool sign) 
   const uint32_t width = lhs.type.isScalarInteger() ? lhs.type.bits() : 64;
   if (!sign) {
     if (op == "==" || op == "!=") {
-      const bool leftIsZero = isZeroConstant(lhs);
-      const bool rightIsZero = isZeroConstant(ctx_.function.expr(e.operand(1)));
-      return std::format("({} {} {})", equalityOperand(e.operand(0), rightIsZero),
-                         op, equalityOperand(e.operand(1), leftIsZero));
+      uint64_t leftConstant = 0;
+      uint64_t rightConstant = 0;
+      const bool leftIsConstant = ctx_.function.asConstant(e.operand(0), leftConstant);
+      const bool rightIsConstant = ctx_.function.asConstant(e.operand(1), rightConstant);
+      return std::format(
+          "({} {} {})",
+          equalityOperand(e.operand(0),
+                          rightIsConstant ? std::optional<uint64_t>{rightConstant}
+                                          : std::nullopt),
+          op,
+          equalityOperand(e.operand(1),
+                          leftIsConstant ? std::optional<uint64_t>{leftConstant}
+                                         : std::nullopt));
     }
     return std::format("({} {} {})", integerOperand(e.operand(0)), op,
                        integerOperand(e.operand(1)));

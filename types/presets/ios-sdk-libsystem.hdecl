@@ -1,0 +1,11 @@
+// libSystem declarations layered on types/presets/ios-sdk.hdecl.
+// Loaded automatically for every AArch64 Mach-O image.
+
+void ___chkstk_darwin(void);
+void ___stack_chk_fail(void);
+extern uintptr_t ___stack_chk_guard;
+int *___error(void);
+
+extern mach_port_t _mach_task_self_;
+extern mach_port_t _bootstrap_port;
+extern const NDR_record_t _NDR_record;

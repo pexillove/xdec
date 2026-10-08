@@ -17,6 +17,8 @@
 // error message, never in a bisection session.
 #pragma once
 
+#include <chrono>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -38,6 +40,16 @@ struct RunStats {
   unsigned iterations = 0;
   /// Whether any iteration changed the function.
   bool changed = false;
+  /// Wall time of the pass's run() calls, and of the verification after them.
+  std::chrono::nanoseconds elapsed{0};
+  std::chrono::nanoseconds verifyElapsed{0};
+  /// Function size going in and coming out.
+  std::size_t blocksBefore = 0;
+  std::size_t blocksAfter = 0;
+  std::size_t opsBefore = 0;
+  std::size_t opsAfter = 0;
+  std::size_t exprsBefore = 0;
+  std::size_t exprsAfter = 0;
 };
 
 /// Observation hooks. Observers must not mutate the function; the dump/diff

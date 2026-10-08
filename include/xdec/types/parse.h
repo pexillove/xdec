@@ -58,4 +58,10 @@ struct ParseReport {
 /// a path and returned unchanged.
 [[nodiscard]] Result<std::string> resolveHeaderPath(std::string_view nameOrPath);
 
+/// Expands a public preset name into the ordered declaration layers it owns.
+/// Paths and ordinary preset names pass through unchanged. Keeping this below
+/// the CLI means automatic target profiles, explicit `--types ios-sdk`, and
+/// embedders all see the same preset rather than three subtly different ones.
+[[nodiscard]] std::vector<std::string> expandPresetBundle(std::string_view source);
+
 }  // namespace xdec::types

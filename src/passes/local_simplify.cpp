@@ -7,7 +7,7 @@
 #include "algebra.h"
 #include "transform.h"
 #include "xdec/il/function.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 namespace xdec::passes {
 
@@ -56,13 +56,13 @@ class LocalSimplify final : public pass::FunctionPass {
     // Algebra before folding: the rules strip filler the constant evaluator
     // cannot see through (and(x,0) over an unknown x, say), and folding then
     // collapses what the rules exposed. Both run again next iteration.
-    const bool algebraChanged = simplifyAlgebra(function);
+    const bool algebraChanged = subPhase("algebra", [&] { return simplifyAlgebra(function); });
     const int64_t algebraMs = clock.lap();
     XDEC_LOG_DEBUG(localLog(), "  algebra {}ms{}", algebraMs, algebraChanged ? " changed" : "");
-    const bool folded = foldConstants(function);
+    const bool folded = subPhase("fold", [&] { return foldConstants(function); });
     const int64_t foldMs = clock.lap();
     XDEC_LOG_DEBUG(localLog(), "  fold {}ms{}", foldMs, folded ? " changed" : "");
-    const bool unflagged = foldFlagConditions(function);
+    const bool unflagged = subPhase("flags", [&] { return foldFlagConditions(function); });
     const int64_t flagsMs = clock.lap();
     XDEC_LOG_DEBUG(localLog(), "  flags {}ms{}", flagsMs, unflagged ? " changed" : "");
     bool blockChanged = false;
@@ -70,8 +70,13 @@ class LocalSimplify final : public pass::FunctionPass {
     int64_t loadMs = 0;
     int64_t dceMs = 0;
     std::size_t megaBlocks = 0;
+    obs::checkpoint("local-simplify blocks");
+    const obs::Span blocksSpan{"subpass", "block-local"};
     for (const il::BlockId blockId : function.blockHandles()) {
       const il::Block& block = function.block(blockId);
+      if (block.ops.size() >= 1024) {
+        obs::checkpoint("local-simplify block");
+      }
       // copyPropagateBlock and forwardRedundantLoads both rebuild substituted
       // expression trees that grow with the block; past kMegaBlockOpThreshold
       // that growth is what hangs a straight-line MBA block for minutes (see

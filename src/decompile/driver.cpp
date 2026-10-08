@@ -10,10 +10,16 @@
 #include <utility>
 #include <vector>
 
+#include "xdec/analysis/execution_coverage.h"
 #include "xdec/analysis/reachability.h"
+#include "xdec/obs/context.h"
+#include "xdec/obs/job.h"
+#include "xdec/obs/log.h"
+#include "xdec/obs/metrics.h"
+#include "xdec/obs/span.h"
 #include "xdec/passes/resolve_indirect.h"
 #include "xdec/spec/lift.h"
-#include "xdec/support/log.h"
+#include "xdec/support/stop.h"
 
 namespace xdec::decompile {
 
@@ -22,6 +28,25 @@ namespace xdec::decompile {
 // rounds are not equal in cost and a run can take minutes with nothing to show
 // for the wait. Set XDEC_LOG=driver=info.
 XDEC_DEFINE_LOG_CATEGORY(driverLog, "driver")
+XDEC_DEFINE_COUNTER(driverRounds, "driver.rounds")
+XDEC_DEFINE_COUNTER(driverSettles, "driver.settles")
+XDEC_DEFINE_COUNTER(driverAdmitted, "driver.admitted_entries")
+
+std::string_view toString(DriverStop stop) noexcept {
+  switch (stop) {
+    case DriverStop::Converged:
+      return "converged";
+    case DriverStop::RoundCap:
+      return "round-cap";
+    case DriverStop::StuckResolution:
+      return "stuck-resolution";
+    case DriverStop::WindDown:
+      return "wind-down";
+    case DriverStop::NoDiscovery:
+      return "no-discovery";
+  }
+  return "?";
+}
 
 namespace {
 
@@ -195,12 +220,15 @@ struct Probe {
 /// backstop anyway" reasoning kRoundCeiling exists for.
 constexpr unsigned kSettleCeiling = 16;
 
-}  // namespace
-
-Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader& reader,
-                               uint64_t entry, pass::Registry& registry,
-                               const DriverOptions& options) {
+Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteReader& reader,
+                                   uint64_t entry, pass::Registry& registry,
+                                   const DriverOptions& options) {
   DriverReport report;
+  report.traceCovered = options.executionCoverage != nullptr;
+  if (options.executionCoverage != nullptr) {
+    report.traceInstructionCount =
+        options.executionCoverage->instructionCount();
+  }
 
   // Every entry a round discovered, in first-seen order; the next round
   // re-lifts from all of them.
@@ -251,6 +279,7 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
       known.insert(va);
       entries.push_back(va);
       report.extraEntries.push_back(va);
+      driverAdmitted().add();
       ++foundNew;
     }
     if (capped > 0) {
@@ -322,17 +351,34 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
   // round already did, now also reused mid-round by the settle loop to bring
   // a pass's own just-admitted discoveries in as real blocks.
   const auto liftKnown = [&]() -> Result<spec::LiftedFunction> {
-    auto lifted = spec::liftFunction(engine, reader, entry, options.memory);
+    obs::checkpoint("driver lift");
+    XDEC_SPAN(liftSpan, "driver", "lift", "entries", entries.size());
+    spec::LiftCoverage dynamicCoverage;
+    const spec::LiftCoverage* liftCoverage = nullptr;
+    if (options.executionCoverage != nullptr) {
+      dynamicCoverage.contains = [&options](uint64_t va) {
+        return options.executionCoverage->contains(va);
+      };
+      dynamicCoverage.successors = [&options](uint64_t va) {
+        return options.executionCoverage->successors(va);
+      };
+      liftCoverage = &dynamicCoverage;
+    }
+    auto lifted =
+        spec::liftFunction(engine, reader, entry, options.memory, liftCoverage);
     if (!lifted) {
       return std::move(lifted).takeUnexpected();
     }
     if (entries.size() > 1) {
       const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
-      auto more = spec::liftBlocksInto(*lifted->function, engine, reader, extra, options.memory);
+      auto more = spec::liftBlocksInto(*lifted->function, engine, reader, extra,
+                                       options.memory, liftCoverage);
       if (!more) {
         return std::move(more).takeUnexpected();
       }
     }
+    liftSpan.set("blocks", lifted->function->blockCount());
+    liftSpan.set("ops", lifted->function->opCount());
     return lifted;
   };
 
@@ -340,20 +386,25 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
   // land, over a fresh lift of every entry with every proved edge already in
   // place. Both ways out of the loop end here, so a run cut short by the cap
   // still yields the function the rounds did manage to uncover.
-  auto finish = [&]() -> Result<DriverResult> {
-    auto whole = spec::liftFunction(engine, reader, entry, options.memory);
+  auto finish = [&](DriverStop stop) -> Result<DriverResult> {
+    report.stop = stop;
+    report.converged = report.traceCovered || stop == DriverStop::Converged;
+    XDEC_LOG_CONTEXT("stage", "finish");
+    XDEC_SPAN(finishSpan, "driver", "finish", "entries", entries.size(), "stop", toString(stop));
+    obs::reportProgress("pipeline",
+                        std::format("final pipeline over {} entr(ies) ({})", entries.size(),
+                                    toString(stop)));
+    auto whole = liftKnown();
     if (!whole) {
       return std::move(whole).takeUnexpected();
     }
-    if (entries.size() > 1) {
-      const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
-      auto more = spec::liftBlocksInto(*whole->function, engine, reader, extra, options.memory);
-      if (!more) {
-        return std::move(more).takeUnexpected();
-      }
-    }
     pass::Manager manager(options.observer);
     configure(manager, reader, options);
+    if (stop == DriverStop::WindDown) {
+      // The job asked for what has been proved so far; a branch discovery never
+      // got to is a marked hole in that answer, not a reason to discard it.
+      manager.setSealUnresolvedBranches(true);
+    }
     XDEC_TRY_VOID(manager.runTo(*whole->function, registry, il::Maturity::Cfg));
     applyResolutions(*whole->function, resolved);
     XDEC_TRY_VOID(manager.runTo(*whole->function, registry, options.target));
@@ -365,7 +416,8 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
     // than leaving to be noticed as an unexplained unused local.
     const std::unordered_set<il::BlockId> reachable =
         analysis::reachableBlocks(*whole->function);
-    if (reachable.size() < whole->function->blockCount()) {
+    if (!report.traceCovered &&
+        reachable.size() < whole->function->blockCount()) {
       report.unreachableBlocks = whole->function->blockCount() - reachable.size();
       XDEC_LOG_WARN(driverLog(),
                     "{} block(s) in the lifted function have no path from entry; nothing "
@@ -376,11 +428,40 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
     return DriverResult{std::move(whole->function), std::move(report)};
   };
 
+  if (options.executionCoverage != nullptr) {
+    if (!options.executionCoverage->contains(entry)) {
+      return err(DiagCode::OutOfRange,
+                 "tracedb coverage does not contain requested entry {:#x}",
+                 entry);
+    }
+    report.converged = true;
+    return finish(DriverStop::NoDiscovery);
+  }
+
   // Grows a round at a time while rounds keep proving something; see
   // DriverOptions::extendWhileProving.
   unsigned budget = std::min(options.maxRounds, DriverOptions::kRoundCeiling);
 
+  // The job asked for whatever has been proved so far (soft deadline, first
+  // Ctrl+C): stop growing the function and go straight to the final run, the
+  // same way the round cap does.
+  const auto windDown = [&]() -> Result<DriverResult> {
+    const obs::Job* job = obs::Job::current();
+    report.windDownReason = job != nullptr ? std::string{job->windDownReason()} : std::string{};
+    XDEC_LOG_WARN(driverLog(),
+                  "winding down ({}) after {} round(s) with {} extra entr(ies); the function is "
+                  "emitted as far as discovery got, and may be partial",
+                  report.windDownReason, report.rounds, report.extraEntries.size());
+    return finish(DriverStop::WindDown);
+  };
+
   for (unsigned round = 0; round < budget; ++round) {
+    if (round > 0 && obs::windDownRequested()) {
+      return windDown();
+    }
+    XDEC_LOG_CONTEXT("round", round + 1);
+    XDEC_SPAN(roundSpan, "driver", std::format("round {}", round + 1), "entries", entries.size());
+    driverRounds().add();
     // Fresh and consistent: the whole function at Lifted, every round.
     auto lifted = liftKnown();
     if (!lifted) {
@@ -393,6 +474,7 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
       pass::Manager manager(options.observer);
       configure(manager, reader, options);
       XDEC_TRY_VOID(manager.runTo(*lifted->function, registry, options.target));
+      report.stop = DriverStop::NoDiscovery;
       return DriverResult{std::move(lifted->function), std::move(report)};
     }
 
@@ -410,9 +492,22 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
     // one probe to see.
     std::size_t foundNew = 0;
     std::size_t foundEdges = 0;
+    bool woundDown = false;
     for (unsigned settle = 0; settle < kSettleCeiling; ++settle) {
+      XDEC_LOG_CONTEXT("settle", settle + 1);
+      XDEC_SPAN(settleSpan, "driver", std::format("settle {}", settle + 1), "blocks",
+                lifted->function->blockCount());
+      driverSettles().add();
+      ++report.settles;
+      obs::reportProgress("discover",
+                          std::format("round {} settle {}: {} block(s), {} entr(ies)",
+                                      report.rounds, settle + 1, lifted->function->blockCount(),
+                                      entries.size()),
+                          report.rounds, budget,
+                          obs::kv("round", report.rounds, "settle", settle + 1, "blocks",
+                                  lifted->function->blockCount(), "entries", entries.size()));
       {
-        pass::Manager manager;  // intermediate passes run unobserved
+        pass::Manager manager(options.discoveryObserver);
         configure(manager, reader, options);
         // Stop at Cfg to put the last pass's edges back before SSA is built
         // over them; see the header for why doing it after would be too late.
@@ -422,7 +517,11 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
       }
 
       Probe probe;
-      XDEC_TRY_VOID(probe.run(*lifted->function, reader, options));
+      {
+        XDEC_SPAN(probeSpan, "driver", "probe");
+        XDEC_TRY_VOID(probe.run(*lifted->function, reader, options));
+        probeSpan.set("discoveries", probe.discoveries.size());
+      }
 
       const std::size_t liftedFrom = entries.size();  // before this pass's finds
       const std::size_t passNew = admitDiscoveries(probe.discoveries);
@@ -453,9 +552,15 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
                     "resolved, {} new address(es), {} new edge(s)",
                     report.rounds, settle + 1, lifted->function->blockCount(), liftedFrom,
                     found.size(), passNew, passEdges);
+      settleSpan.set("new_addresses", passNew);
+      settleSpan.set("new_edges", passEdges);
       if (passNew == 0) {
         // Nothing this pass admitted needs lifting; another pass over the
         // same blocks would just re-derive what this one already proved.
+        break;
+      }
+      if (obs::windDownRequested()) {
+        woundDown = true;
         break;
       }
       // The pass's own discoveries are only candidates until they are real
@@ -465,6 +570,11 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
         return std::move(relifted).takeUnexpected();
       }
       lifted = std::move(relifted);
+    }
+    roundSpan.set("new_addresses", foundNew);
+    roundSpan.set("new_edges", foundEdges);
+    if (woundDown) {
+      return windDown();
     }
 
     if (foundNew == 0 && foundEdges == 0) {
@@ -478,10 +588,9 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
                       "block (likely unmapped memory); stopping here rather than "
                       "reporting a convergence that leaves it out",
                       report.rounds);
-        return finish();
+        return finish(DriverStop::StuckResolution);
       }
-      report.converged = true;
-      return finish();
+      return finish(DriverStop::Converged);
     }
     // Reaching here means the round proved something, so the budget running out
     // now would cut the loop short mid-discovery rather than at a fixpoint.
@@ -502,7 +611,17 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
                 "(last at {:#x}); the function is emitted as far as the rounds got it",
                 budget, report.extraEntries.size(),
                 report.extraEntries.empty() ? 0 : report.extraEntries.back());
-  return finish();
+  return finish(DriverStop::RoundCap);
+}
+
+}  // namespace
+
+Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader& reader,
+                               uint64_t entry, pass::Registry& registry,
+                               const DriverOptions& options) {
+  XDEC_LOG_CONTEXT("entry", obs::hex(entry));
+  XDEC_SPAN(span, "driver", "decompile", "entry", obs::hex(entry));
+  return catchStop([&] { return decompileImpl(engine, reader, entry, registry, options); });
 }
 
 }  // namespace xdec::decompile

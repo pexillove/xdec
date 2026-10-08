@@ -3,12 +3,25 @@
 #include <charconv>
 #include <cstdio>
 
+#include "run_context.h"
+
 namespace xdec::cli {
+
+XDEC_DEFINE_LOG_CATEGORY_LEVEL(cliLog, "cli", ::xdec::obs::LogLevel::Info)
 
 void printLine(std::string_view text) {
   std::fwrite(text.data(), 1, text.size(), stdout);
   std::fputc('\n', stdout);
 }
+
+namespace detail {
+void say(obs::LogLevel level, std::string message) {
+  obs::LogCategory& category = cliLog();
+  if (category.enabled(level)) {
+    obs::detail::emit(category, level, std::source_location::current(), {}, std::move(message));
+  }
+}
+}  // namespace detail
 
 bool parseNumber(std::string_view text, uint64_t& out) {
   int base = 10;
@@ -26,8 +39,18 @@ bool parseNumber(std::string_view text, uint64_t& out) {
 }
 
 int reportError(const xdec::Diag& diag) {
-  print("error: {}", diag.format());
-  return 1;
+  printError("{}", diag.format());
+  if (RunContext* run = RunContext::current(); run != nullptr) {
+    run->noteDiag(diag);
+  }
+  switch (diag.code()) {
+    case DiagCode::Cancelled:
+      return 130;
+    case DiagCode::Timeout:
+      return 124;
+    default:
+      return 1;
+  }
 }
 
 int usage() {
@@ -47,20 +70,9 @@ int usage() {
   printLine("  observe <binary> <address> [...] lift a function, run passes, dump each step");
   printLine("      options: --to <maturity> --out <dir> --plugin <path>");
   printLine("  decompile <binary> <address> [...] the full pipeline: lift, resolve, emit C");
-  printLine("      options: -o <file.c> --rounds <n> --no-annotate --allow-unresolved");
-  printLine("               --max-span <bytes> (drop discoveries past entry+bytes)");
-  printLine("               --discovery-cap <n> (skip branches offering more targets)");
-  printLine("               --no-path-explore (disable the path-sensitive resolve-indirect fallback)");
-  printLine("               --path-explore-max-paths <n> (default 64; see docs/23-path-eval.md)");
-  printLine("               --path-explore-canary-fail (also explore a stack-canary mismatch arm)");
+  printLine("      options: -o <file.c> --engine <tracedb-dir> (emit only executed CFG)");
   printLine("               --types <header|preset> (repeatable)");
   printLine("               --syscall-table <file|name|none> (default aarch64-linux)");
-  printLine("               --reuse-report (count same-block subexpression duplication)");
-  printLine("               --emit-report (count IL-level redundant-temp shapes)");
-  printLine("               --dump-il (print the IL after all passes, before structuring)");
-  printLine("               --helpers-header <path|none> (default xdec_helpers.h)");
-  printLine("               --arg-naming <indexed|reg> (default indexed: arg1, arg2, ...)");
-  printLine("               --security-hints <comment|keep> (default comment)");
   printLine("  exec <binary> <workload>         execute blocks against scripted states");
   printLine("  memdump <binary> <out>           dump the relocated memory view for emulators");
   printLine("  decode                           decode hex words from stdin (fuzzer iface)");
@@ -69,7 +81,26 @@ int usage() {
   printLine("  coverage <binary> [rows]         report what the spec does not decode");
   printLine("  log-categories                   list logging categories");
   printLine("");
-  printLine("Set XDEC_LOG=<category>=<level> for diagnostics, e.g. XDEC_LOG=pass=debug,local=debug.");
+  printLine("run options (any command, anywhere on the line):");
+  printLine("  --log <spec>          category levels, e.g. driver=info,pass=debug (repeatable;");
+  printLine("                        same grammar as XDEC_LOG, applied after it)");
+  printLine("  -v, --verbose         every category at info");
+  printLine("  -q, --quiet           only warnings and errors on stderr");
+  printLine("  --log-file <path>     also write the log there (.jsonl/.json: JSON Lines)");
+  printLine("  --log-format <text|json>  override the log file format");
+  printLine("  --trace <path>        Chrome trace of every span (open in ui.perfetto.dev)");
+  printLine("  --profile             print a per-span timing table to stderr at the end");
+  printLine("  --report <path>       JSON run report: outcome, timings, counters, memory, warnings");
+  printLine("  --progress <auto|always|never>  live status line on stderr (auto: when a TTY)");
+  printLine("  --timeout <dur>       stop discovering after <dur> and emit what was proved");
+  printLine("  --on-timeout <partial|abort>  partial (default) allows a grace period to finish");
+  printLine("  --hard-timeout <dur>  cancel outright after <dur> (default: timeout + max(30s, timeout/2))");
+  printLine("  --watchdog <dur>      report open spans when nothing progresses for <dur> (default 120s, 0 off)");
+  printLine("  --machine             JSON Lines log/progress/result on stderr, for GUIs and scripts");
+  printLine("  --crash-dir <dir>     where a crash report is written (default: current directory)");
+  printLine("  durations: 1500ms, 90s, 5m, 1h. Ctrl+C once: wind down to a partial result; twice: cancel.");
+  printLine("");
+  printLine("stdout carries only the command's result; status, warnings and errors go to stderr.");
   printLine("Set XDEC_SPEC=<file.xspec> to override the architecture spec.");
   return 2;
 }

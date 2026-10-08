@@ -30,6 +30,8 @@ CContext::CContext(const il::Function& theFunction, const analysis::VariableTabl
       structured(theStructured),
       options(theOptions),
       literals(theOptions.imageReader, theOptions.memory),
+      addressExpressions(theFunction, theVariables, theFrame,
+                         theOptions.typedVariables, theOptions.types),
       deadOps(theStructured.root
                   ? collectDeadOps(theFunction, theFrame, theVariables, *theStructured.root,
                                    theOptions)
@@ -231,17 +233,37 @@ struct Displacement {
   uint64_t offset = 0;
 };
 
+[[nodiscard]] il::ExprId stripAddressCasts(const il::Function& function,
+                                           il::ExprId id) {
+  while (id.valid()) {
+    const il::Expr& expr = function.expr(id);
+    if ((expr.op != il::ExprOp::Bitcast && expr.op != il::ExprOp::ZExt &&
+         expr.op != il::ExprOp::Trunc) ||
+        expr.operandCount != 1) {
+      break;
+    }
+    const il::Expr& source = function.expr(expr.operand(0));
+    if (!expr.type.isScalarInteger() || !source.type.isScalarInteger() ||
+        expr.type.bits() != source.type.bits()) {
+      break;
+    }
+    id = expr.operand(0);
+  }
+  return id;
+}
+
 [[nodiscard]] Displacement split(const il::Function& function, il::ExprId address) {
+  address = stripAddressCasts(function, address);
   const il::Expr& expr = function.expr(address);
   if (expr.op != il::ExprOp::Add || expr.operandCount != 2) {
     return {address, 0};
   }
   uint64_t value = 0;
   if (function.asConstant(expr.operand(1), value)) {
-    return {expr.operand(0), value};
+    return {stripAddressCasts(function, expr.operand(0)), value};
   }
   if (function.asConstant(expr.operand(0), value)) {
-    return {expr.operand(1), value};
+    return {stripAddressCasts(function, expr.operand(1)), value};
   }
   return {address, 0};
 }
@@ -257,6 +279,16 @@ types::TypeId CContext::typeOfValue(il::ValueId value) const {
   // struct. See analysis::TypedVariables and COptions::typedVariables.
   if (options.typedVariables != nullptr) {
     if (const std::optional<types::TypeId> typed = options.typedVariables->forValue(value)) {
+      const types::TypeEntry* entry =
+          options.types == nullptr
+              ? nullptr
+              : options.types->get(options.types->resolveTypedef(*typed));
+      // An IL call always has a machine result slot, but a void prototype
+      // supplies no C value with which to type that slot. Keep the inferred
+      // integer temporary when later machine code still reads it.
+      if (entry != nullptr && entry->kind == types::TypeKind::Void) {
+        return {};
+      }
       return *typed;
     }
   }
@@ -272,12 +304,40 @@ bool CContext::valueIsPointer(il::ValueId value) const {
   return entry != nullptr && entry->kind == types::TypeKind::Pointer;
 }
 
+std::string CContext::byteBufferView(const std::string& baseName, const std::string& path,
+                                     const types::TypeEntry& array, uint64_t byteOffset,
+                                     uint32_t width, types::TypeId baseType) {
+  const types::TypeDatabase& database = *options.types;
+  const types::TypeEntry* element = database.get(database.resolveTypedef(array.element));
+  if (element == nullptr || element->kind != types::TypeKind::Int || element->bitWidth != 8) {
+    return {};  // only a buffer of bytes has no element worth naming
+  }
+  if (width <= 8 || width % 8 != 0) {
+    return {};
+  }
+  const uint64_t bytes = width / 8;
+  if (array.arrayLength == types::kUnknownArrayLength ||
+      byteOffset + bytes > array.arrayLength) {
+    return {};  // straddles the end: the header and the code disagree
+  }
+  (void)spell(baseType);
+  return std::format("(*({}*)&{}->{}[0x{:x}])", intType(width), baseName, path, byteOffset);
+}
+
 std::string CContext::fieldAccess(il::ExprId address, uint32_t width,
                                   il::ValueId result) {
   if (!binder_) {
     return {};
   }
-  const Displacement at = split(function, address);
+  Displacement at = split(function, address);
+  if (const std::optional<analysis::AddressExpr> proven =
+          addressExpressions.classify(address);
+      proven.has_value() && proven->byteOffset >= 0 &&
+      (proven->kind == analysis::AddressBaseKind::Argument ||
+       proven->kind == analysis::AddressBaseKind::Value)) {
+    at = Displacement{proven->base,
+                      static_cast<uint64_t>(proven->byteOffset)};
+  }
   const il::Expr& base = function.expr(at.base);
 
   // Two ways to know what a base points at: it is a parameter the header
@@ -317,25 +377,65 @@ std::string CContext::fieldAccess(il::ExprId address, uint32_t width,
   if (record == nullptr) {
     return {};
   }
-  for (const types::StructField& field : record->fields) {
-    if (field.offset != at.offset) {
-      continue;
-    }
-    const std::optional<uint64_t> size = database.sizeOf(field.type);
-    if (!size.has_value() || *size * 8 != width) {
-      return {};  // the right place, the wrong shape: say nothing rather than
-                  // name a field the code is not reading whole
-    }
-    // Only a pointer is carried forward. Reading an `int32_t` field says
-    // nothing further about the value that is worth changing a declaration
-    // for; reading a `EvalNode*` one is what makes the next hop nameable.
-    if (result.valid() && binder_->pointeeRecord(field.type) != nullptr) {
-      valueTypes.emplace(result.index(), field.type);
-    }
-    (void)spell(baseType);
-    return std::format("{}->{}", baseName, field.name);
+
+  const types::TypeEntry* pointer =
+      database.get(database.resolveTypedef(baseType));
+  if (pointer == nullptr || pointer->kind != types::TypeKind::Pointer) {
+    return {};
   }
-  return {};
+  types::TypeDatabase::FieldPath field =
+      database.fieldAt(pointer->element, at.offset, width);
+  if (!field.found()) {
+    return {};
+  }
+
+  std::string path;
+  for (const std::string& name : field.names) {
+    path += path.empty() ? name : "." + name;
+  }
+  types::TypeId accessedType = field.type;
+  const types::TypeEntry* accessed =
+      database.get(database.resolveTypedef(accessedType));
+  if (accessed != nullptr && accessed->kind == types::TypeKind::Array) {
+    const std::optional<uint64_t> elementSize =
+        database.sizeOf(accessed->element);
+    if (!elementSize.has_value() || *elementSize == 0) {
+      return {};
+    }
+    if (*elementSize * 8 != width) {
+      // A wider access inside a byte buffer: the header described wire bytes
+      // (a MIG descriptor, a packed payload) and the machine read an integer
+      // out of them. No element names that, but the buffer does, and saying
+      // which byte of which field is being reinterpreted beats an offset from
+      // the object's own head that the reader has to subtract by hand.
+      return byteBufferView(baseName, path, *accessed, field.remainder, width,
+                            baseType);
+    }
+    if (field.remainder % *elementSize != 0) {
+      return {};
+    }
+    const uint64_t index = field.remainder / *elementSize;
+    if (accessed->arrayLength != types::kUnknownArrayLength &&
+        index >= accessed->arrayLength) {
+      return {};
+    }
+    path += std::format("[0x{:x}]", index);
+    accessedType = accessed->element;
+    field.remainder = 0;
+  }
+  const std::optional<uint64_t> size = database.sizeOf(accessedType);
+  if (field.remainder != 0 || !size.has_value() || *size * 8 != width) {
+    return {};  // a covering field is not enough: the access must name one
+                // complete field/element rather than span wire-layout bytes
+  }
+  // Only a pointer is carried forward. Reading an `int32_t` field says
+  // nothing further about the value that is worth changing a declaration
+  // for; reading an `EvalNode*` one is what makes the next hop nameable.
+  if (result.valid() && binder_->pointeeRecord(accessedType) != nullptr) {
+    valueTypes.emplace(result.index(), accessedType);
+  }
+  (void)spell(baseType);
+  return std::format("{}->{}", baseName, path);
 }
 
 std::string CContext::spell(types::TypeId id) {
@@ -379,6 +479,12 @@ types::TypeId CContext::functionReturnType() const {
     return {};
   }
   const std::optional<types::TypeId> typed = options.typedVariables->returnType();
+  if (typed.has_value() && options.types->format(*typed) == "void") {
+    // A void ABI result has no value for the body to contradict. Lifters still
+    // record the physical return register, but it is unspecified at source
+    // level and must not force `return x0;` into a declared void function.
+    return *typed;
+  }
   const std::optional<analysis::CType>& inferred = variables.returnType();
   if (!typed.has_value() || !inferred.has_value() ||
       !binder_->consistent(*typed, inferred->width, inferred->pointerDepth)) {

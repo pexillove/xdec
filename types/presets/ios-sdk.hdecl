@@ -2,6 +2,11 @@
 // iOS binary reaches through dyld bind slots (see docs/10-import-resolution.md
 // and src/binary/macho.cpp's rebase/bind opcode interpreter).
 //
+// This is the public root of an automatically expanded bundle. Loading
+// `ios-sdk` also loads ios-sdk-libsystem, ios-sdk-posix, ios-sdk-cf-ext, and
+// ios-sdk-mach-ipc in dependency order. Security, os_log, and private-SPI
+// layers are added only when the Mach-O import table proves they are needed.
+//
 // Not a copy of the Apple SDK headers -- the set of declarations that shows up
 // when reading a decompiled Mach-O AArch64 binary's imports, kept just
 // detailed enough that resolve-call stops printing these as
@@ -34,26 +39,57 @@ typedef unsigned long vm_size_t;
 typedef unsigned int mach_msg_option_t;
 typedef unsigned int mach_msg_size_t;
 typedef unsigned int mach_msg_timeout_t;
+typedef unsigned int mach_msg_bits_t;
+typedef int mach_msg_id_t;
 
-// mach_msg_header_t's fields are never read directly by the calls this
-// preset types -- every caller just forwards a buffer it already built --
-// so it stays opaque rather than guessing at padding no site here needs.
-struct mach_msg_header_t;
+typedef struct mach_msg_header_t {
+  mach_msg_bits_t msgh_bits;
+  mach_msg_size_t msgh_size;
+  mach_port_t msgh_remote_port;
+  mach_port_t msgh_local_port;
+  mach_port_t msgh_voucher_port;
+  mach_msg_id_t msgh_id;
+} mach_msg_header_t;
 
-kern_return_t _mach_msg(struct mach_msg_header_t *msg, mach_msg_option_t option,
+typedef struct {
+  unsigned int msgh_descriptor_count;
+} mach_msg_body_t;
+
+typedef struct {
+  void *address;
+  unsigned char deallocate;
+  unsigned char copy;
+  unsigned char pad1;
+  unsigned char type;
+  mach_msg_size_t size;
+} mach_msg_ool_descriptor_t;
+
+typedef struct {
+  unsigned char mig_vers;
+  unsigned char if_vers;
+  unsigned char reserved1;
+  unsigned char mig_encoding;
+  unsigned char int_rep;
+  unsigned char char_rep;
+  unsigned char float_rep;
+  unsigned char reserved2;
+} NDR_record_t;
+
+kern_return_t _mach_msg(mach_msg_header_t *msg, mach_msg_option_t option,
                         mach_msg_size_t send_size, mach_msg_size_t rcv_size,
                         mach_port_t rcv_name, mach_msg_timeout_t timeout,
                         mach_port_t notify);
-void _mach_msg_destroy(struct mach_msg_header_t *msg);
+void _mach_msg_destroy(mach_msg_header_t *msg);
 kern_return_t _mach_port_deallocate(mach_port_t task, mach_port_t name);
 kern_return_t _vm_allocate(mach_port_t target_task, vm_address_t *address, vm_size_t size,
                            int flags);
 kern_return_t _vm_deallocate(mach_port_t target_task, vm_address_t address, vm_size_t size);
+void _mig_deallocate(vm_address_t address, vm_size_t size);
 
 kern_return_t _bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
 kern_return_t _bootstrap_check_in(mach_port_t bp, const char *service_name, mach_port_t *sp);
 
-void _voucher_mach_msg_set(struct mach_msg_header_t *msg);
+void _voucher_mach_msg_set(mach_msg_header_t *msg);
 
 // ---------------------------------------------------------------------------
 // CoreFoundation
@@ -72,6 +108,7 @@ typedef struct __CFRunLoop *CFRunLoopRef;
 typedef struct __CFRunLoopSource *CFRunLoopSourceRef;
 typedef struct __CFMachPort *CFMachPortRef;
 typedef struct __CFFileDescriptor *CFFileDescriptorRef;
+typedef struct __CFDictionary *CFDictionaryRef;
 typedef struct __CFDictionary *CFMutableDictionaryRef;
 
 struct CFRange {
@@ -122,7 +159,7 @@ typedef io_object_t io_connect_t;
 
 kern_return_t _IOMasterPort(mach_port_t bootstrapPort, mach_port_t *masterPort);
 CFMutableDictionaryRef _IOServiceMatching(const char *name);
-kern_return_t _IOServiceGetMatchingServices(mach_port_t masterPort, CFDataRef matching,
+kern_return_t _IOServiceGetMatchingServices(mach_port_t masterPort, CFDictionaryRef matching,
                                             io_iterator_t *existing);
 io_service_t _IOIteratorNext(io_iterator_t iterator);
 kern_return_t _IOObjectRelease(io_object_t object);
@@ -144,8 +181,12 @@ int _kqueue(void);
 int _kevent(int kq, const struct kevent *changelist, int nchanges, struct kevent *eventlist,
            int nevents, const struct timespec *timeout);
 
-typedef struct { int64_t opaque[8]; } pthread_rwlock_t;
-typedef struct { int32_t opaque[1]; } pthread_once_t;
+// Measured on device / SDK: pthread_rwlock_t is { long __sig; char __opaque[192] }
+// = 200 bytes; pthread_once_t is { long __sig; char __opaque[8] } = 16 bytes
+// (see xdec_trace_adid/artifacts/<uuid>/pthread_once_abi.md and
+// xdec_trace_remote/tools/ios_probe/rwlock_abi.c).
+typedef struct { int64_t opaque[25]; } pthread_rwlock_t;
+typedef struct { int64_t opaque[2]; } pthread_once_t;
 
 int _pthread_once(pthread_once_t *control, void (*init)(void));
 int _pthread_rwlock_init(pthread_rwlock_t *lock, const void *attr);
@@ -153,6 +194,8 @@ int _pthread_rwlock_destroy(pthread_rwlock_t *lock);
 int _pthread_rwlock_rdlock(pthread_rwlock_t *lock);
 int _pthread_rwlock_wrlock(pthread_rwlock_t *lock);
 int _pthread_rwlock_unlock(pthread_rwlock_t *lock);
+int _pthread_rwlock_tryrdlock(pthread_rwlock_t *lock);
+int _pthread_rwlock_trywrlock(pthread_rwlock_t *lock);
 
 struct timespec {
   time_t tv_sec;

@@ -379,8 +379,11 @@ class Parser {
   }
 
   /// `__attribute__((...))`, `__asm__("...")` and friends: balanced groups that
-  /// carry nothing this parser models. Consuming them is what lets real NDK
-  /// headers through.
+  /// carry nothing this parser models, with one exception. `packed` changes
+  /// where every later field lives, so it is read out of the group rather than
+  /// skipped with it, and left in `sawPacked_` for whoever is building the
+  /// aggregate to pick up -- C allows the attribute on either side of the
+  /// body, and only the caller knows which aggregate it belongs to.
   bool skipAttributes() {
     bool skipped = false;
     while (true) {
@@ -396,20 +399,25 @@ class Parser {
       }
       advance();
       if (peek().is("(")) {
-        skipBalanced("(", ")");
+        skipBalanced("(", ")", &sawPacked_);
       }
       skipped = true;
     }
     return skipped;
   }
 
-  void skipBalanced(std::string_view open, std::string_view close) {
+  void skipBalanced(std::string_view open, std::string_view close,
+                    bool* sawPacked = nullptr) {
     if (!accept(open)) {
       return;
     }
     int depth = 1;
     while (!atEnd() && depth > 0) {
       const Token& token = advance();
+      if (sawPacked != nullptr && token.kind == Tok::Ident &&
+          (token.text == "packed" || token.text == "__packed__")) {
+        *sawPacked = true;
+      }
       if (token.is(open)) {
         ++depth;
       } else if (token.is(close)) {
@@ -534,6 +542,13 @@ class Parser {
         XDEC_TRY(const TypeId aggregate, parseAggregateSpecifier(token.text));
         result.type = aggregate;
         sawTypeName = true;
+        // `struct { ... } __attribute__((packed)) name;` -- the attribute sits
+        // between the body and the declarator, so this loop is what sees it,
+        // and it applies to the aggregate just defined.
+        sawPacked_ = false;
+        if (skipAttributes() && sawPacked_ && token.text != "enum") {
+          XDEC_TRY_VOID(database_->setPacked(aggregate));
+        }
         continue;
       }
       if (isBuiltinKeyword(token.text)) {
@@ -636,6 +651,7 @@ class Parser {
 
   [[nodiscard]] Result<TypeId> parseAggregateSpecifier(const std::string& keyword) {
     advance();  // struct / union / enum
+    sawPacked_ = false;
     skipAttributes();
     const TypeKind kind = keyword == "struct"  ? TypeKind::Struct
                           : keyword == "union" ? TypeKind::Union
@@ -670,11 +686,19 @@ class Parser {
       return id;
     }
 
+    // The body's own fields may carry attributes of their own, so what the
+    // aggregate was marked with before the brace is what counts here; a
+    // trailing `__attribute__((packed))` is picked up by parseSpecifiers,
+    // which is the first thing to see the tokens after the closing brace.
+    const bool packedBeforeBody = sawPacked_;
     XDEC_TRY(std::vector<StructField> fields, parseStructBody());
     if (alreadyComplete) {
       return err(DiagCode::ParseError, std::format("redefinition of {} '{}'", keyword, tag));
     }
     XDEC_TRY_VOID(database_->defineAggregate(id, std::move(fields)));
+    if (packedBeforeBody) {
+      XDEC_TRY_VOID(database_->setPacked(id));
+    }
     return id;
   }
 
@@ -992,6 +1016,9 @@ class Parser {
   std::map<std::string, int64_t> constants_;
   TypeDatabase* database_;
   std::size_t pos_ = 0;
+  /// Set by `skipAttributes` when the group it consumed contained `packed`;
+  /// read and cleared by whoever is building the aggregate it applies to.
+  bool sawPacked_ = false;
   ParseReport report_;
 };
 
@@ -1048,6 +1075,21 @@ Result<std::string> resolveHeaderPath(std::string_view nameOrPath) {
   return err(DiagCode::IoError,
              std::format("no header or preset named '{}' (looked in '{}')", nameOrPath,
                          preset.string()));
+}
+
+std::vector<std::string> expandPresetBundle(std::string_view source) {
+  if (source != "ios-sdk") {
+    return {std::string{source}};
+  }
+  // Dependency order matters: every layer deliberately reuses the primitive,
+  // CF, and Mach names declared by the public root.
+  return {
+      "ios-sdk",
+      "ios-sdk-libsystem",
+      "ios-sdk-posix",
+      "ios-sdk-cf-ext",
+      "ios-sdk-mach-ipc",
+  };
 }
 
 }  // namespace xdec::types

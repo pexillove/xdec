@@ -1,0 +1,9 @@
+// Security.framework declarations, loaded when a Mach-O imports SecTask.
+
+typedef struct __SecTask *SecTaskRef;
+
+SecTaskRef _SecTaskCreateWithAuditToken(CFAllocatorRef allocator,
+                                         audit_token_t token);
+CFTypeRef _SecTaskCopyValueForEntitlement(SecTaskRef task,
+                                           CFStringRef entitlement,
+                                           CFErrorRef *error);

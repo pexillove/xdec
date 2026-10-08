@@ -18,8 +18,11 @@
 #include "xdec/binary/cache_pointer.h"
 #include "xdec/il/function.h"
 #include "xdec/il/printer.h"
+#include "xdec/obs/job.h"
+#include "xdec/obs/log.h"
+#include "xdec/obs/metrics.h"
+#include "xdec/obs/span.h"
 #include "xdec/support/bits.h"
-#include "xdec/support/log.h"
 
 namespace xdec::passes {
 
@@ -36,6 +39,8 @@ namespace {
 // forty targets of which two were never lifted is a discovery problem, and the
 // two want opposite responses. Set XDEC_LOG=resolve=debug to get them.
 XDEC_DEFINE_LOG_CATEGORY(resolveLog, "resolve")
+XDEC_DEFINE_COUNTER(resolveAttempts, "resolve.branches_attempted")
+XDEC_DEFINE_COUNTER(resolveResolved, "resolve.branches_resolved")
 
 class ResolveIndirect final : public pass::FunctionPass {
  public:
@@ -89,7 +94,16 @@ class ResolveIndirect final : public pass::FunctionPass {
           !function.targets(terminator).empty()) {
         continue;
       }
-      changed |= resolveOne(context, eval, dominators, pathExplorer, blockId, terminatorId);
+      obs::checkpoint("resolve-indirect");
+      XDEC_SPAN(branchSpan, "resolve", "branch", "va", obs::hex(terminator.va));
+      resolveAttempts().add();
+      const bool resolved =
+          resolveOne(context, eval, dominators, pathExplorer, blockId, terminatorId);
+      branchSpan.set("resolved", resolved);
+      if (resolved) {
+        resolveResolved().add();
+      }
+      changed |= resolved;
     }
     if (changed) {
       function.rebuildEdges();
@@ -178,9 +192,17 @@ class ResolveIndirect final : public pass::FunctionPass {
     std::optional<uint64_t> read;
     std::vector<il::ExprId> work{target};
     std::vector<bool> seenValue(function.valueCount(), false);
+    // Expressions are interned, so an MBA-heavy target shares subtrees
+    // everywhere; walking it as a tree is exponential in its depth.
+    std::vector<bool> seenExpr(function.exprCount(), false);
     while (!work.empty()) {
-      const il::Expr& expr = function.expr(work.back());
+      const il::ExprId id = work.back();
       work.pop_back();
+      if (seenExpr[id.index()]) {
+        continue;
+      }
+      seenExpr[id.index()] = true;
+      const il::Expr& expr = function.expr(id);
       if (expr.op == il::ExprOp::Value) {
         const il::ValueId value{static_cast<uint32_t>(expr.immediate)};
         if (!function.hasValue(value) || seenValue[value.index()]) {
@@ -249,11 +271,14 @@ class ResolveIndirect final : public pass::FunctionPass {
       return tableRead.has_value() && va > *tableRead && va <= branchVa;
     };
 
-    std::vector<uint64_t> candidates =
-        tableCandidates(context, eval, dominators, blockId, operands[0]);
+    std::vector<uint64_t> candidates = [&] {
+      XDEC_SPAN(span, "resolve", "table");
+      return tableCandidates(context, eval, dominators, blockId, operands[0]);
+    }();
     std::erase_if(candidates, skipsOwnTableRead);
     const std::size_t fromTable = candidates.size();
     if (candidates.empty()) {
+      XDEC_SPAN(span, "resolve", "value-set");
       candidates = valueSetCandidates(eval, operands[0]);
       std::erase_if(candidates, skipsOwnTableRead);
     }
@@ -267,6 +292,7 @@ class ResolveIndirect final : public pass::FunctionPass {
       candidates = pathEvalCandidates(pathExplorer, branchVa);
       std::erase_if(candidates, skipsOwnTableRead);
     }
+
     if (candidates.empty()) {
       // The expression itself, because a shape that did not match is a question
       // about what the shape actually was, and no summary of it substitutes for
@@ -416,7 +442,10 @@ class ResolveIndirect final : public pass::FunctionPass {
                                         const analysis::Dominators& dominators,
                                         il::BlockId blockId, il::ExprId target) {
     const il::Function& function = context.function();
-    const auto table = analysis::matchJumpTable(function, target, singleValue(eval));
+    const auto table = [&] {
+      XDEC_SPAN(span, "resolve", "match-table");
+      return analysis::matchJumpTable(function, target, singleValue(eval));
+    }();
     if (!table || table->stride == 0) {
       return {};
     }
@@ -433,8 +462,10 @@ class ResolveIndirect final : public pass::FunctionPass {
     }
 
     // A bound is on the index, so the entry count is one more than it.
-    const std::optional<uint64_t> proven =
-        analysis::boundOnIndex(function, dominators, blockId, table->index);
+    const std::optional<uint64_t> proven = [&] {
+      XDEC_SPAN(span, "resolve", "index-bound");
+      return analysis::boundOnIndex(function, dominators, blockId, table->index);
+    }();
     const ByteReader& image = *context.image();
 
     // The precise paths: enumerate the entries the index can actually select,
@@ -520,7 +551,10 @@ class ResolveIndirect final : public pass::FunctionPass {
 
     // Concrete values first, from the evaluator every other resolver in this
     // file already trusts.
-    const analysis::ValueSet indexValues = eval.eval(table->index);
+    const analysis::ValueSet indexValues = [&] {
+      XDEC_SPAN(span, "resolve", "index-values");
+      return eval.eval(table->index);
+    }();
     if (!indexValues.isTop() && !indexValues.values().empty()) {
       std::vector<uint64_t> preciseIndices(indexValues.values().begin(),
                                            indexValues.values().end());
@@ -544,8 +578,11 @@ class ResolveIndirect final : public pass::FunctionPass {
     // obfuscated dispatch takes: an index computed from a call's return value
     // is top to any evaluator that needs the value, and still only ever two
     // numbers once the shift and the OR around it are read.
-    if (const std::optional<std::vector<uint64_t>> shaped =
-            analysis::preciseIndexSet(function, table->index)) {
+    const std::optional<std::vector<uint64_t>> shaped = [&] {
+      XDEC_SPAN(span, "resolve", "index-shape");
+      return analysis::preciseIndexSet(function, table->index);
+    }();
+    if (shaped) {
       if (std::vector<uint64_t> out =
               entriesFor(*shaped, "the index's shape", /*tolerateDeadCombinations=*/true);
           !out.empty()) {

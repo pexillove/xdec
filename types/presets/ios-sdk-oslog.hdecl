@@ -1,0 +1,10 @@
+// Unified logging declarations, loaded when the image imports os_log.
+
+typedef struct os_log_s *os_log_t;
+typedef uint8_t os_log_type_t;
+
+extern os_log_t __os_log_default;
+
+bool _os_log_type_enabled(os_log_t log, os_log_type_t type);
+void __os_log_impl(void *dso, os_log_t log, os_log_type_t type,
+                   const char *format, uint8_t *buffer, uint32_t size);

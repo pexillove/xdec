@@ -1,6 +1,8 @@
 // TypeBinder (see the header for which evidence binds and which does not).
 #include "xdec/types/binder.h"
 
+#include <format>
+
 namespace xdec::types {
 
 namespace {
@@ -57,7 +59,14 @@ const TypeEntry* TypeBinder::prototypeFor(const Binding& binding) const {
 }
 
 const TypeEntry* TypeBinder::prototypeAt(uint64_t va) const {
-  return prototypeFor(at(va));
+  if (const TypeEntry* named = prototypeFor(at(va))) {
+    return named;
+  }
+  // Stripped binaries have no symbol to bind against, but the C emitter uses
+  // this stable generated spelling for their functions. A project header can
+  // therefore type a known address explicitly without first patching a symbol
+  // table into the binary.
+  return prototypeFor(forName(std::format("sub_{:x}", va)));
 }
 
 const TypeEntry* TypeBinder::pointeeOf(TypeId id) const {

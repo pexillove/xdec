@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <set>
 #include <span>
 
 #include "xdec/il/verify.h"
@@ -160,6 +161,34 @@ TEST_CASE("an indirect branch ends its block unresolved, by design", "[lift][fun
   const xdec::il::Block& block = function.block(function.entryBlock());
   CHECK(block.successors.empty());
   CHECK(function.op(block.ops.back()).isTerminator());
+}
+
+TEST_CASE("dynamic coverage lifts only the observed arm", "[lift][function][trace]") {
+  WordMemory memory;
+  memory.put(0x1000, kMovX0_0);
+  memory.put(0x1004, kCbzX0_pC);  // static arms: 0x1008 and 0x1010
+  memory.put(0x1008, kMovX0_1);
+  memory.put(0x100c, kRet);
+  memory.put(0x1010, kMovX0_2);
+  memory.put(0x1014, kRet);
+
+  const std::set<uint64_t> executed{0x1000, 0x1004, 0x1008, 0x100c};
+  xdec::spec::LiftCoverage coverage;
+  coverage.contains = [&executed](uint64_t va) { return executed.contains(va); };
+  coverage.successors = [](uint64_t va) {
+    return va == 0x1004 ? std::vector<uint64_t>{0x1008}
+                        : std::vector<uint64_t>{};
+  };
+
+  auto result = liftFunction(engine(), memory.reader(), 0x1000, {}, &coverage);
+  REQUIRE(result);
+  const xdec::il::Function& function = *result->function;
+  const xdec::il::Block& fork = function.block(function.entryBlock());
+  REQUIRE(fork.successors.size() == 1);
+  CHECK(function.block(fork.successors.front()).va == 0x1008);
+  const xdec::il::BlockId unobserved = function.blockAt(0x1010);
+  CHECK((!unobserved.valid() || function.block(unobserved).external));
+  CHECK(result->unresolved.empty());
 }
 
 TEST_CASE("a branch into the unmapped resolves to a stub block", "[lift][function]") {

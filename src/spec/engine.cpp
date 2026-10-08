@@ -4,7 +4,7 @@
 
 #include "xdec/spec/compile.h"
 #include "xdec/support/bits.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 namespace xdec::spec {
 

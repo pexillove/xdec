@@ -46,6 +46,21 @@ struct LiftedBlock {
 /// byte source without depending on the lifter.
 using ByteReader = xdec::ByteReader;
 
+/// Optional dynamic coverage used to lift only one or more observed executions.
+///
+/// `contains` answers whether an instruction executed. `successors` returns the
+/// observed in-function successors of a control-transfer instruction. Calls
+/// must name their continuation rather than their callee: callees are separate
+/// functions and are not spliced into the caller's CFG.
+struct LiftCoverage {
+  std::function<bool(uint64_t)> contains;
+  std::function<std::vector<uint64_t>(uint64_t)> successors;
+
+  [[nodiscard]] bool active() const noexcept {
+    return static_cast<bool>(contains) && static_cast<bool>(successors);
+  }
+};
+
 struct LiftedFunction {
   std::unique_ptr<il::Function> function;
   il::BlockId entry;
@@ -83,7 +98,8 @@ struct LiftedFunction {
 [[nodiscard]] Result<LiftedFunction> liftFunction(const SpecEngine& engine,
                                                   const ByteReader& reader,
                                                   uint64_t entry,
-                                                  const MemoryFacts& facts = {});
+                                                  const MemoryFacts& facts = {},
+                                                  const LiftCoverage* coverage = nullptr);
 
 /// Incremental discovery into an existing function: scans and elaborates
 /// basic blocks starting at `entries`, splicing them into `function` next to
@@ -106,6 +122,7 @@ struct LiftBlocksResult {
                                                       const SpecEngine& engine,
                                                       const ByteReader& reader,
                                                       std::span<const uint64_t> entries,
-                                                      const MemoryFacts& facts = {});
+                                                      const MemoryFacts& facts = {},
+                                                      const LiftCoverage* coverage = nullptr);
 
 }  // namespace xdec::spec

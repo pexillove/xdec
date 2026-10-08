@@ -46,6 +46,29 @@ TargetProfile inferTargetProfile(const BinaryImage& image) {
     // tried (§7.4). A sidecar's own literal overrides this per binary if a
     // future device or kernel version differs.
     profile.entryRegLiterals = {{"x28", 0}};
+
+    bool security = false;
+    bool osLog = false;
+    bool spi = false;
+    for (const Symbol& symbol : image.symbols()) {
+      if (symbol.defined) {
+        continue;
+      }
+      const std::string_view name = symbol.name;
+      security |= name.starts_with("_SecTask");
+      osLog |= name.starts_with("__os_log_") || name.starts_with("_os_log_");
+      spi |= name == "_MGCopyAnswer" || name == "_notify_post" ||
+             name.starts_with("_container_") || name == "_ptrace";
+    }
+    if (security) {
+      profile.typePresets.push_back("ios-sdk-security");
+    }
+    if (osLog) {
+      profile.typePresets.push_back("ios-sdk-oslog");
+    }
+    if (spi) {
+      profile.typePresets.push_back("ios-sdk-spi");
+    }
   }
   if (image.format() == BinaryFormat::DyldCache && image.arch() == Arch::AArch64) {
     // A shared-cache-resident function is still ordinary iOS system code --

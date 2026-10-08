@@ -212,3 +212,44 @@ TEST_CASE("a call argument into writable memory is never guessed as a literal",
   CHECK(contains(text, "0x20000"));
   CHECK(!contains(text, "\"hi\""));
 }
+
+TEST_CASE("an unsigned call parameter absorbs a matching root zero extension",
+          "[emit][address-form]") {
+  Fixture f;
+  const il::ValueId loaded =
+      f.function.appendLoad(f.entry, 0x1000, Type::integer(32), f.i64(0x20000));
+  const ExprId widened = f.function.cast(
+      ExprOp::ZExt, Type::integer(64), f.function.valueRef(loaded));
+  const il::OpId call = f.function.appendCall(f.entry, 0x1004, f.i64(0x9000));
+  f.function.setOperands(call, std::vector<ExprId>{f.i64(0x9000), widened});
+  f.function.appendReturn(f.entry, 0x1008);
+
+  COptions options;
+  options.names = namedAt(0x9000, "take_size");
+  const TypeDatabase database = parse("void take_size(uint64_t size);");
+  options.types = &database;
+  const std::string text = f.emit(options);
+  INFO(text);
+  CHECK(contains(text, "take_size((*(uint32_t*)(0x20000)));"));
+  CHECK(!contains(text, "take_size(((uint64_t)"));
+}
+
+TEST_CASE("a signed call destination keeps explicit zero-extension semantics",
+          "[emit][address-form]") {
+  Fixture f;
+  const il::ValueId loaded =
+      f.function.appendLoad(f.entry, 0x1000, Type::integer(32), f.i64(0x20000));
+  const ExprId widened = f.function.cast(
+      ExprOp::ZExt, Type::integer(64), f.function.valueRef(loaded));
+  const il::OpId call = f.function.appendCall(f.entry, 0x1004, f.i64(0x9000));
+  f.function.setOperands(call, std::vector<ExprId>{f.i64(0x9000), widened});
+  f.function.appendReturn(f.entry, 0x1008);
+
+  COptions options;
+  options.names = namedAt(0x9000, "take_signed");
+  const TypeDatabase database = parse("void take_signed(int64_t value);");
+  options.types = &database;
+  const std::string text = f.emit(options);
+  INFO(text);
+  CHECK(contains(text, "take_signed(((uint64_t)((*(uint32_t*)(0x20000)))));"));
+}

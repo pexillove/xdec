@@ -231,6 +231,33 @@ SymId SymPool::unary(SymOp op, SymId operand) {
   return intern(node);
 }
 
+/// When `candidate` is `y - term`, reports `y`: their sum is what it started
+/// from before the subtraction.
+bool SymPool::subtrahendOf(SymId candidate, SymId term, SymId& result) const {
+  if (!nodes_.contains(candidate)) return false;
+  const SymNode& node = nodes_[candidate];
+  if (node.op != SymOp::Sub || node.operandCount != 2) return false;
+  if (node.operands[1] != term) return false;
+  result = node.operands[0];
+  return true;
+}
+
+/// When `sum` is an addition with `term` as one side, reports the other side.
+bool SymPool::addendBesides(SymId sum, SymId term, SymId& result) const {
+  if (!nodes_.contains(sum)) return false;
+  const SymNode& node = nodes_[sum];
+  if (node.op != SymOp::Add || node.operandCount != 2) return false;
+  if (node.operands[0] == term) {
+    result = node.operands[1];
+    return true;
+  }
+  if (node.operands[1] == term) {
+    result = node.operands[0];
+    return true;
+  }
+  return false;
+}
+
 SymId SymPool::binary(SymOp op, SymId lhs, SymId rhs) {
   if (isUnknown(lhs) || isUnknown(rhs)) {
     return unknown_;
@@ -272,6 +299,25 @@ SymId SymPool::binary(SymOp op, SymId lhs, SymId rhs) {
         return constant(0);
       default:
         break;
+    }
+  }
+
+  // `x + (y - x)` is `y` and `(x + y) - y` is `x`, whatever x and y are.
+  // These are exact under wraparound rather than approximations, and they are
+  // the shape width arithmetic takes: a slice of `n` bits joined to the
+  // remaining `width - n` has to come out provably `width` wide even though
+  // `n` is a decode field nobody has a value for yet. Without them the whole
+  // permute and lane-extract family is unmodellable.
+  if (op == SymOp::Add) {
+    SymId folded;
+    if (subtrahendOf(rhs, lhs, folded) || subtrahendOf(lhs, rhs, folded)) {
+      return folded;
+    }
+  }
+  if (op == SymOp::Sub) {
+    SymId folded;
+    if (addendBesides(lhs, rhs, folded)) {
+      return folded;
     }
   }
 

@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <format>
+#include <optional>
 #include <vector>
 
 #include "c_context.h"
 #include "c_expr.h"
 #include "c_helpers.h"
 #include "c_stmt.h"
+#include "xdec/obs/span.h"
 
 namespace xdec::emit {
 
@@ -27,16 +29,21 @@ class Assembler {
 
   std::string run() {
     nameResultTemps();
-    StmtPrinter statements(ctx_, expressions_);
-    const std::string body = statements.run();
+    const std::string body = [&] {
+      XDEC_SPAN(span, "emit", "statements");
+      StmtPrinter statements(ctx_, expressions_);
+      return statements.run();
+    }();
     // Declarations before the preamble: naming a register variable is what
     // introduces the entry extern the preamble has to declare. The signature
     // comes before it for the same reason -- an imported parameter type is a
     // type the preamble then has to define.
+    XDEC_SPAN(declSpan, "emit", "declarations");
     const std::string locals = declarations();
     const std::string head = signature();
 
     std::string out = preamble();
+    declSpan.end();
     out += location();
     out += head;
     out += " {\n";
@@ -302,8 +309,11 @@ class Assembler {
     // Subexpressions ExprPrinter promoted out of duplicated text: same
     // declare-once shape as the temps above, just named by CSE order rather
     // than by the op that defines them.
-    for (const auto& [name, width] : ctx_.cseTemps) {
-      addPlain(intType(width == 0 ? 64 : width), name);
+    for (const CseTemp& temporary : ctx_.cseTemps) {
+      addPlain(temporary.pointer
+                   ? "uint8_t*"
+                   : intType(temporary.width == 0 ? 64 : temporary.width),
+               temporary.name);
     }
     flushGroup();
     if (!out.empty()) {
@@ -483,7 +493,12 @@ std::string printFunction(const il::Function& function,
                           const analysis::StackFrame& frame,
                           const StructuredFunction& structured,
                           const COptions& options) {
-  return Assembler(function, variables, frame, structured, options).run();
+  std::optional<Assembler> assembler;
+  {
+    XDEC_SPAN(span, "emit", "context");
+    assembler.emplace(function, variables, frame, structured, options);
+  }
+  return assembler->run();
 }
 
 }  // namespace xdec::emit

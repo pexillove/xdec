@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <iosfwd>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -69,6 +68,45 @@ struct InstructionRecord {
   uint64_t callTarget = 0;
 };
 
+/// What an indirect transfer turned out to be. Taken from the lifted
+/// instruction's flow, not from the mnemonic, so an observer does not have to
+/// decode anything to tell a computed branch within a function from a call to
+/// another one.
+enum class IndirectTransferKind : uint8_t {
+  Branch,
+  Call,
+};
+
+/// Where a computed branch or call actually went.
+///
+/// Reported separately from InstructionRecord because the record is finalized
+/// before the interpreter's outcome is known, and reported at all because the
+/// target is otherwise unrecoverable from a trace: for a `blr` the next
+/// instruction executed is the callee only when the call stayed inside the
+/// image, and is the continuation after the return when a model handled it.
+/// Guessing from adjacency gets that case wrong every time.
+struct IndirectTransferRecord {
+  uint64_t source = 0;
+  uint64_t target = 0;
+  IndirectTransferKind kind = IndirectTransferKind::Branch;
+};
+
+/// The shape of every executed control transfer, reported from the
+/// interpreter's outcome rather than inferred from the next trace row.
+enum class ControlTransferKind : uint8_t {
+  DirectBranch,
+  ConditionalBranch,
+  IndirectBranch,
+  Call,
+  Return,
+};
+
+struct ControlTransferRecord {
+  uint64_t source = 0;
+  uint64_t target = 0;
+  ControlTransferKind kind = ControlTransferKind::DirectBranch;
+};
+
 struct BoundaryRecord {
   uint64_t pc = 0;
   uint64_t returnPc = 0;
@@ -131,6 +169,17 @@ class IExecObserver {
   virtual void onBoundaryEffect(const BoundaryEffectRecord& record) {
     (void)record;
   }
+  /// Called once per executed indirect branch or indirect call, after the
+  /// source instruction's own record, whether or not the target lies inside
+  /// the traced image.
+  virtual void onIndirectTransfer(const IndirectTransferRecord& record) {
+    (void)record;
+  }
+  /// Called once for every executed branch, call, or return after its concrete
+  /// target has been resolved. This is the authoritative control-flow event.
+  virtual void onControlTransfer(const ControlTransferRecord& record) {
+    (void)record;
+  }
 };
 
 class CallbackTraceSink final : public IExecObserver {
@@ -167,22 +216,18 @@ class VectorTraceSink final : public IExecObserver {
   void onBoundaryEffect(const BoundaryEffectRecord& record) override {
     effects.push_back(record);
   }
+  void onIndirectTransfer(const IndirectTransferRecord& record) override {
+    transfers.push_back(record);
+  }
+  void onControlTransfer(const ControlTransferRecord& record) override {
+    controlTransfers.push_back(record);
+  }
 
   std::vector<InstructionRecord> instructions;
   std::vector<BoundaryRecord> boundaries;
   std::vector<BoundaryEffectRecord> effects;
-};
-
-class TextTraceSink final : public IExecObserver {
- public:
-  explicit TextTraceSink(std::ostream& output) : output_(&output) {}
-
-  void onInstruction(const InstructionRecord& record) override;
-  void onBoundary(const BoundaryRecord& record) override;
-  void onBoundaryEffect(const BoundaryEffectRecord& record) override;
-
- private:
-  std::ostream* output_;
+  std::vector<IndirectTransferRecord> transfers;
+  std::vector<ControlTransferRecord> controlTransfers;
 };
 
 }  // namespace xdec::exec

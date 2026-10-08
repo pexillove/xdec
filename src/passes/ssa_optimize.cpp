@@ -12,7 +12,7 @@
 
 #include "xdec/il/ceval.h"
 #include "xdec/il/function.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 #include "algebra.h"
 #include "transform.h"
@@ -712,21 +712,21 @@ class SsaOptimize final : public pass::FunctionPass {
     // an opaque condition code. Folding again here is what turns a cross-block
     // `b.ne` into the compare it is — and an opaque condition is a wall to
     // everything downstream, propagation and switch recovery included.
-    const bool unflagged = foldFlagConditions(function);
+    const bool unflagged = subPhase("flags", [&] { return foldFlagConditions(function); });
     const int64_t flags = clock.lap();
     XDEC_LOG_DEBUG(optimizeLog(), "  flags {}ms{}", flags, unflagged ? " changed" : "");
-    const bool propagated = Sccp(function).run();
+    const bool propagated = subPhase("sccp", [&] { return Sccp(function).run(); });
     const int64_t sccp = clock.lap();
     XDEC_LOG_DEBUG(optimizeLog(), "  sccp {}ms{}", sccp, propagated ? " changed" : "");
     // Algebra after propagation: constants the analysis materialised plug
     // straight into the rules, and the rules unblock the next propagation.
-    const bool simplified = simplifyAlgebra(function);
+    const bool simplified = subPhase("algebra", [&] { return simplifyAlgebra(function); });
     const int64_t algebra = clock.lap();
     XDEC_LOG_DEBUG(optimizeLog(), "  algebra {}ms{}", algebra, simplified ? " changed" : "");
-    const bool merged = simplifyPhis(function);
+    const bool merged = subPhase("phis", [&] { return simplifyPhis(function); });
     const int64_t phis = clock.lap();
     XDEC_LOG_DEBUG(optimizeLog(), "  phis {}ms{}", phis, merged ? " changed" : "");
-    const bool collected = dce(function);
+    const bool collected = subPhase("dce", [&] { return dce(function); });
     // This pass runs to fixpoint over four sub-analyses of quite different cost,
     // so its total says nothing about which one to look at — and a sub-analysis
     // that reports a change it did not make costs the whole pass another

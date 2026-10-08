@@ -19,12 +19,44 @@
 // register zero-extended, which is what the architecture does and what removes
 // the need to name a view: `ldr s0` is `v0 = zext(load(addr, 32), 128)`.
 
-fn replace_low_byte(v: bits(128), lane: int(0..7), b: bits(8)) -> bits(128) {
-  let shift = lane * 8;
-  let keep = imm(ones_int(64) ^ (0xff << shift), 64);
-  let low = (extract(v, 0, 64) & keep) |
-            (zext(b, 64) << imm(shift, 64));
-  return concat(extract(v, 64, 64), low);
+// Writing one lane of a vector means rebuilding the register around it. The
+// two halves are handled separately because a mask is an ordinary 64-bit
+// immediate, while a 128-bit one is not expressible here.
+fn insert_bits64(h: bits(64), shift: int(0..63), mask: int, x: bits(64))
+    -> bits(64) {
+  let keep = imm(ones_int(64) ^ (mask << shift), 64);
+  return (h & keep) | ((x & imm(mask, 64)) << imm(shift, 64));
+}
+
+// The caller passes the half and the offset within it rather than one lane
+// offset, because in every encoding that reaches here the half is exactly the
+// Q bit. Splitting it that way is what keeps both arguments provably in range:
+// derived from Q and one other field, each is a small sum, whereas a single
+// 0..127 offset would have to be narrowed back down by masking.
+fn insert_lane(v: bits(128), half: int(0..1), shift: int(0..63), mask: int,
+               x: bits(64)) -> bits(128) {
+  if half == 1 {
+    return concat(insert_bits64(extract(v, 64, 64), shift, mask, x),
+                  extract(v, 0, 64));
+  } else {
+    return concat(extract(v, 64, 64),
+                  insert_bits64(extract(v, 0, 64), shift, mask, x));
+  }
+}
+
+fn replicate8(x: bits(8)) -> bits(64) {
+  let pair = concat(x, x);
+  let quad = concat(pair, pair);
+  return concat(quad, quad);
+}
+
+fn replicate16(x: bits(16)) -> bits(64) {
+  let pair = concat(x, x);
+  return concat(pair, pair);
+}
+
+fn replicate32(x: bits(32)) -> bits(64) {
+  return concat(x, x);
 }
 
 fn structure_even_bytes64(v: bits(64)) -> bits(32) {
@@ -266,6 +298,32 @@ insn ldp_fp_offset {
   }
 }
 
+// The non-temporal pair forms differ from LDP/STP only in the index bits, and
+// the hint they carry is about cache allocation. Nothing here models caches,
+// so they behave exactly like the ordinary pair.
+insn stnp_fp {
+  encoding opc:2 "101100" "0" "0" imm7:7 Rt2:5 Rn:5 Rt:5
+  require opc != 3;
+  asm "stnp {Rt:vreg(32 << opc)}, {Rt2:vreg(32 << opc)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + opc):dec}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + opc), 64);
+    store(base, trunc(vec[Rt], 32 << opc));
+    store(base + imm(4 << opc, 64), trunc(vec[Rt2], 32 << opc));
+  }
+}
+
+insn ldnp_fp {
+  encoding opc:2 "101100" "0" "1" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  require opc != 3;
+  asm "ldnp {Rt:vreg(32 << opc)}, {Rt2:vreg(32 << opc)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + opc):dec}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + opc), 64);
+    vec[Rt] = zext(load(base, 32 << opc), 128);
+    vec[Rt2] = zext(load(base + imm(4 << opc, 64), 32 << opc), 128);
+  }
+}
+
 insn stp_fp_pre {
   encoding opc:2 "101101" "1" "0" imm7:7 Rt2:5 Rn:5 Rt:5
   require Rn == 31 || (Rn != Rt && Rn != Rt2);
@@ -329,21 +387,179 @@ insn ldr_fp_literal {
   }
 }
 
-// Advanced SIMD single-structure lane transfers used by the target library.
-insn ld1_byte_lane {
-  encoding "0000110101000000000" lane:3 Rn:5 Rt:5
-  asm "ld1 {Rt:vreg(128)}.b[{lane:dec}], \[{Rn:regsp(1)}\]"
+// ---------------------------------------------------------------------------
+// Advanced SIMD load/store single structure
+// ---------------------------------------------------------------------------
+//
+// One lane moves between memory and a vector register. These are ordinary
+// memory accesses with an awkward operand, not vector arithmetic, so they are
+// modelled for the same reason the whole-register forms are.
+//
+// Each rule covers all three addressing modes the family has, because they
+// differ only in two fields: bit 23 selects post-indexing, and within that an
+// Rm of 31 selects an immediate step equal to the transfer size instead of a
+// register step. Splitting them into separate rules would triple the count
+// without separating anything that behaves differently.
+//
+// `require post == 1 || Rm == 0` keeps the non-indexed form from claiming
+// encodings the architecture leaves unallocated: with bit 23 clear, Rm is a
+// field that must read as zero rather than a register number.
+//
+// The lane index is assembled from Q, S and size, which is how the
+// architecture spends three scattered bits to name up to sixteen lanes. Q is
+// always its top bit, so Q alone says which half of the register is touched
+// and the remaining bits say where within that half.
+//
+// The 16-bit forms split the size field into its two bits rather than
+// matching it whole, because only the upper one carries lane information and
+// the lower one is required to be zero. Writing that into the encoding is
+// what lets the lane arrive already provably in range.
+
+insn ld1_single_8 {
+  encoding "0" Q:1 "001101" post:1 "1" "0" Rm:5 "000" S:1 size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld1 \{{Rt:vreg(128)}.b\}[{Q * 8 + S * 4 + size:dec}], \[{Rn:regsp(1)}\]"
   semantics {
-    vec[Rt] = replace_low_byte(vec[Rt], lane,
-                               load(read_gpr_sp(Rn, 1), 8));
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, (S * 4 + size) * 8, 0xff,
+                          zext(load(base, 8), 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(1, 64) : read_gpr(Rm, 1)));
+    }
   }
 }
 
-insn st1_byte_lane {
-  encoding "0000110100000000000" lane:3 Rn:5 Rt:5
-  asm "st1 {Rt:vreg(128)}.b[{lane:dec}], \[{Rn:regsp(1)}\]"
+insn st1_single_8 {
+  encoding "0" Q:1 "001101" post:1 "0" "0" Rm:5 "000" S:1 size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st1 \{{Rt:vreg(128)}.b\}[{Q * 8 + S * 4 + size:dec}], \[{Rn:regsp(1)}\]"
   semantics {
-    store(read_gpr_sp(Rn, 1), extract(vec[Rt], lane * 8, 8));
+    let base = read_gpr_sp(Rn, 1);
+    store(base, extract(vec[Rt], (Q * 8 + S * 4 + size) * 8, 8));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(1, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld1_single_16 {
+  encoding "0" Q:1 "001101" post:1 "1" "0" Rm:5 "010" S:1 sizehi:1 "0" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld1 \{{Rt:vreg(128)}.h\}[{Q * 4 + S * 2 + sizehi:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, (S * 2 + sizehi) * 16, 0xffff,
+                          zext(load(base, 16), 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(2, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn st1_single_16 {
+  encoding "0" Q:1 "001101" post:1 "0" "0" Rm:5 "010" S:1 sizehi:1 "0" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st1 \{{Rt:vreg(128)}.h\}[{Q * 4 + S * 2 + sizehi:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, extract(vec[Rt], (Q * 4 + S * 2 + sizehi) * 16, 16));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(2, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld1_single_32 {
+  encoding "0" Q:1 "001101" post:1 "1" "0" Rm:5 "100" S:1 "00" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld1 \{{Rt:vreg(128)}.s\}[{Q * 2 + S:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, S * 32, 0xffffffff,
+                          zext(load(base, 32), 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(4, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn st1_single_32 {
+  encoding "0" Q:1 "001101" post:1 "0" "0" Rm:5 "100" S:1 "00" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st1 \{{Rt:vreg(128)}.s\}[{Q * 2 + S:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, extract(vec[Rt], (Q * 2 + S) * 32, 32));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(4, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld1_single_64 {
+  encoding "0" Q:1 "001101" post:1 "1" "0" Rm:5 "100" "0" "01" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld1 \{{Rt:vreg(128)}.d\}[{Q:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, 0, ones_int(64), load(base, 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(8, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn st1_single_64 {
+  encoding "0" Q:1 "001101" post:1 "0" "0" Rm:5 "100" "0" "01" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st1 \{{Rt:vreg(128)}.d\}[{Q:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, extract(vec[Rt], Q * 64, 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(8, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+// LD1R loads one element and fills every lane with it. Q selects whether the
+// upper half is written too; the architecture zeroes it when Q is clear,
+// which is what makes a load of the 64-bit form observable as a full write.
+insn ld1r {
+  encoding "0" Q:1 "001101" post:1 "1" "0" Rm:5 "110" "0" size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld1r \{{Rt:vreg(128)}\}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    if size == 0 {
+      let filled = replicate8(load(base, 8));
+      vec[Rt] = Q == 1 ? concat(filled, filled) : zext(filled, 128);
+    } else {
+      if size == 1 {
+        let filled = replicate16(load(base, 16));
+        vec[Rt] = Q == 1 ? concat(filled, filled) : zext(filled, 128);
+      } else {
+        if size == 2 {
+          let filled = replicate32(load(base, 32));
+          vec[Rt] = Q == 1 ? concat(filled, filled) : zext(filled, 128);
+        } else {
+          let filled = load(base, 64);
+          vec[Rt] = Q == 1 ? concat(filled, filled) : zext(filled, 128);
+        }
+      }
+    }
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(1 << size, 64) : read_gpr(Rm, 1)));
+    }
   }
 }
 

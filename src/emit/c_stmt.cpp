@@ -13,6 +13,7 @@
 #include "xdec/analysis/indexed_transform_loop.h"
 #include "xdec/analysis/noreturn.h"
 #include "xdec/il/expr_roots.h"
+#include "xdec/obs/span.h"
 #include "xdec/passes/recover_syscall.h"
 #include "xdec/types/syscall_table.h"
 
@@ -50,7 +51,7 @@ namespace {
 /// The low `width` bits as a C constant, in a form that works past 64 bits.
 [[nodiscard]] std::string lowMask(uint32_t width, const std::string& type) {
   if (width >= 64) {
-    return std::format("(((({})1) << {}) - 1)", type, width);
+    return std::format("(((({})0x1) << 0x{:x}) - 0x1)", type, width);
   }
   return std::format("0x{:x}", (uint64_t{1} << width) - 1);
 }
@@ -74,6 +75,82 @@ using il::collectValueLeaves;
     return 0;
   }
   return static_cast<uint32_t>(database.sizeOf(param->element).value_or(1) * 8);
+}
+
+[[nodiscard]] bool implicitUnsignedCallWidening(
+    const CContext& ctx, const types::TypeEntry* callee, std::size_t index,
+    il::ExprId operand) {
+  if (callee == nullptr || callee->variadic || ctx.options.types == nullptr ||
+      index >= callee->params.size()) {
+    return false;
+  }
+  const il::Expr& expression = ctx.function.expr(operand);
+  if (expression.op != il::ExprOp::ZExt || expression.operandCount != 1) {
+    return false;
+  }
+  const il::Expr& source = ctx.function.expr(expression.operand(0));
+  if (!source.type.isScalarInteger()) {
+    return false;
+  }
+  bool sourceIsUnsigned = false;
+  if (source.op == il::ExprOp::Const || source.op == il::ExprOp::Trunc ||
+      source.op == il::ExprOp::ZExt || source.op == il::ExprOp::CmpEq ||
+      source.op == il::ExprOp::CmpNe || source.op == il::ExprOp::CmpLtU ||
+      source.op == il::ExprOp::CmpLeU) {
+    sourceIsUnsigned = true;
+  } else if (source.op == il::ExprOp::EntryReg) {
+    const analysis::Variable* argument = ctx.variables.argumentFor(
+        il::RegId{static_cast<uint32_t>(source.immediate)});
+    sourceIsUnsigned = argument != nullptr && !argument->type.isSigned;
+    if (argument != nullptr) {
+      const types::TypeId declared = ctx.argumentType(*argument);
+      if (declared.valid()) {
+        const types::TypeEntry* entry = ctx.options.types->get(
+            ctx.options.types->resolveTypedef(declared));
+        sourceIsUnsigned =
+            entry != nullptr &&
+            (entry->kind == types::TypeKind::Bool ||
+             (entry->kind == types::TypeKind::Int && !entry->isSigned));
+      }
+    }
+  } else if (source.op == il::ExprOp::Value) {
+    const il::ValueId value{static_cast<uint32_t>(source.immediate)};
+    if (ctx.function.hasValue(value)) {
+      const il::OpId definition = ctx.function.value(value).definition;
+      sourceIsUnsigned =
+          definition.valid() &&
+          ctx.function.op(definition).code == il::OpCode::Load;
+    }
+    if (const analysis::Variable* temporary = ctx.variables.tempFor(value)) {
+      sourceIsUnsigned = sourceIsUnsigned || !temporary->type.isSigned;
+    }
+    if (const types::TypeId declared = ctx.typeOfValue(value);
+        declared.valid()) {
+      const types::TypeEntry* entry = ctx.options.types->get(
+          ctx.options.types->resolveTypedef(declared));
+      sourceIsUnsigned =
+          entry != nullptr &&
+          (entry->kind == types::TypeKind::Bool ||
+           (entry->kind == types::TypeKind::Int && !entry->isSigned));
+    }
+  }
+  if (!sourceIsUnsigned) {
+    return false;
+  }
+  const types::TypeDatabase& database = *ctx.options.types;
+  const types::TypeEntry* destination =
+      database.get(database.resolveTypedef(callee->params[index].type));
+  if (destination == nullptr ||
+      (destination->kind != types::TypeKind::Int &&
+       destination->kind != types::TypeKind::Bool &&
+       destination->kind != types::TypeKind::Enum) ||
+      destination->isSigned) {
+    return false;
+  }
+  const std::optional<uint64_t> size =
+      database.sizeOf(callee->params[index].type);
+  return size.has_value() && *size * 8 >= source.type.bits() &&
+         expression.type.bits() == *size * 8;
 }
 
 /// Whether `arm` is exactly a `goto`/`continue` leaf and nothing else -- the
@@ -234,9 +311,9 @@ void StmtPrinter::printStmt(const StmtPtr& stmt, std::string& out) {
 void StmtPrinter::printIf(const Stmt& stmt, std::string& out) {
   const il::BlockId head = last_;
   expressions_.beginScope({stmt.cond});
-  std::string condition = assignedText(stmt.cond, out);
-  if (stmt.invertCond) {
-    condition = std::format("!({})", condition);
+  const std::string condition = expressions_.condition(stmt.cond, stmt.invertCond);
+  for (const std::string& decl : expressions_.takePendingDecls()) {
+    line(out, decl);
   }
 
   // The two targets, so an empty arm can still carry its edge's copies.
@@ -320,9 +397,9 @@ void StmtPrinter::printWhile(const Stmt& stmt, std::string& out) {
     return;
   }
   expressions_.beginScope({stmt.cond});
-  std::string condition = assignedText(stmt.cond, out);
-  if (stmt.invertCond) {
-    condition = std::format("!({})", condition);
+  const std::string condition = expressions_.condition(stmt.cond, stmt.invertCond);
+  for (const std::string& decl : expressions_.takePendingDecls()) {
+    line(out, decl);
   }
   line(out, std::format("while ({}) {{", condition));
   ++indent_;
@@ -481,7 +558,7 @@ void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out, bool openScope
         line(out, std::format("case 0x{:x}: /* handler @0x{:x} */", stmt.caseValues[index],
                               ctx_.function.block(stmt.cases[index]).va));
       } else {
-        line(out, std::format("case {}: /* handler @0x{:x} */", index,
+        line(out, std::format("case 0x{:x}: /* handler @0x{:x} */", index,
                               ctx_.function.block(stmt.cases[index]).va));
       }
     } else {
@@ -982,6 +1059,7 @@ void StmtPrinter::printBlock(const Stmt& stmt, std::string& out,
   // predecessor, and a label is where every other predecessor arrives.
   consumePending(stmt.block, out);
   const il::Block& block = ctx_.function.block(stmt.block);
+  XDEC_SPAN(blockSpan, "emit", "block", "va", obs::hex(block.va), "ops", block.ops.size());
   if (ctx_.structured.isLabeled(stmt.block)) {
     out += std::format("{}:\n", label(stmt.block));
   }
@@ -1183,7 +1261,11 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
                             ctx_.function.nameOf(op.payload)));
       break;
     case il::OpCode::Return:
-      if (operands.empty()) {
+      if (const types::TypeEntry* declared = ctx_.prototype();
+          declared != nullptr &&
+          ctx_.options.types->format(declared->returnType) == "void") {
+        line(out, "return;");
+      } else if (operands.empty()) {
         line(out, "return;");
       } else if (!printSelectReturn(operands[0], out)) {
         const std::string value = assignedText(operands[0], out);
@@ -1308,6 +1390,9 @@ std::string StmtPrinter::callArgumentText(const types::TypeEntry* callee, std::s
       return rendered->text;
     }
   }
+  if (implicitUnsignedCallWidening(ctx_, callee, paramIndex, operand)) {
+    return assignedInt(operand, out);
+  }
   return exprText(operand, out);
 }
 
@@ -1343,7 +1428,9 @@ void StmtPrinter::printCall(il::OpId opId, const il::Op& op, std::string& out) {
   }
   const std::string suffix = trimmed ? " /* + unknown arg(s) */" : "";
   const std::string* temp = ctx_.tempFor(op.result);
-  const std::string assignee = temp == nullptr ? "" : *temp + " = ";
+  const bool returnsVoid =
+      callee != nullptr && ctx_.options.types->format(callee->returnType) == "void";
+  const std::string assignee = temp == nullptr || returnsVoid ? "" : *temp + " = ";
   uint64_t address = 0;
   if (ctx_.function.asConstant(operands[0], address)) {
     const std::string calleeName = ctx_.calleeName(address);
@@ -1500,7 +1587,7 @@ bool StmtPrinter::printSyscall(const il::Op& op, std::string& out) {
     // still the most useful thing on the line, so it leads.
     callee = "__xdec_syscall";
     ctx_.helpers.insert("syscall");
-    arguments = known ? std::format("{}", number) : numberText + " /* x8 */";
+    arguments = known ? std::format("0x{:x}", number) : numberText + " /* x8 */";
     for (const std::string& arg : args) {
       arguments += ", " + arg;
     }
@@ -1613,7 +1700,7 @@ std::string StmtPrinter::registerRead(il::RegId reg) {
   const std::string window =
       info.offsetInParent == 0
           ? variable.name
-          : std::format("({} >> {})", variable.name, info.offsetInParent);
+          : std::format("({} >> 0x{:x})", variable.name, info.offsetInParent);
   return std::format("(({})({}))", intType(info.bits), window);
 }
 
@@ -1634,12 +1721,12 @@ std::string StmtPrinter::registerWrite(il::RegId reg, const std::string& value) 
   const std::string shifted =
       info.offsetInParent == 0
           ? std::format("(({})({}) & {})", rootType, value, mask)
-          : std::format("((({})({}) & {}) << {})", rootType, value, mask,
+          : std::format("((({})({}) & {}) << 0x{:x})", rootType, value, mask,
                         info.offsetInParent);
   const std::string cleared =
       info.offsetInParent == 0
           ? std::format("({} & ~({}){})", variable.name, rootType, mask)
-          : std::format("({} & ~((({}){}) << {}))", variable.name, rootType, mask,
+          : std::format("({} & ~((({}){}) << 0x{:x}))", variable.name, rootType, mask,
                         info.offsetInParent);
   return std::format("{} = {} | {};", variable.name, cleared, shifted);
 }
@@ -1697,7 +1784,9 @@ std::vector<StmtPrinter::EdgeCopy> StmtPrinter::edgeCopies(il::BlockId from,
 }
 
 void StmtPrinter::printEdge(il::BlockId from, il::BlockId to, std::string& out) {
+  XDEC_SPAN(edgeSpan, "emit", "edge", "from", obs::hex(ctx_.function.block(from).va));
   std::vector<EdgeCopy> copies = edgeCopies(from, to);
+  edgeSpan.set("copies", copies.size());
   if (copies.empty()) {
     return;
   }
@@ -1819,7 +1908,7 @@ void StmtPrinter::printEdge(il::BlockId from, il::BlockId to, std::string& out) 
         assignees += copies[i].name + " = ";
         names += (i == index ? "" : ", ") + copies[i].name;
       }
-      line(out, std::format("{}0; /* {}: never set up on this edge */", assignees, names));
+      line(out, std::format("{}0x0; /* {}: never set up on this edge */", assignees, names));
       index = end;
       continue;
     }

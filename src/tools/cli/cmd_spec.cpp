@@ -35,10 +35,10 @@ int commandSpec(std::string_view path, std::string_view output) {
   xdec::spec::CheckResult checked = xdec::spec::check(module);
 
   for (const xdec::Diag& diag : checked.report.errors) {
-    print("error: {}", diag.format());
+    printError("{}", diag.format());
   }
   for (const xdec::Diag& diag : checked.report.warnings) {
-    print("warning: {}", diag.format());
+    warn("{}", diag.format());
   }
 
   print("arch        : {} {}-bit {}-endian, {}-bit instructions", module.arch.name,
@@ -64,7 +64,7 @@ int commandSpec(std::string_view path, std::string_view output) {
     file.write(reinterpret_cast<const char*>(blob.data()),
                static_cast<std::streamsize>(blob.size()));
     if (!file) {
-      print("error: could not write '{}'", output);
+      printError("could not write '{}'", output);
       return 1;
     }
     print("blob        : {} bytes -> {}", blob.size(), output);
@@ -193,7 +193,7 @@ int commandDecode() {
     }
     uint64_t word = 0;
     if (!parseNumber(text, word)) {
-      print("error: '{}' is not a number", text);
+      printError("'{}' is not a number", text);
       ++failures;
       continue;
     }

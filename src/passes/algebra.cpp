@@ -6,7 +6,7 @@
 
 #include "xdec/il/ceval.h"
 #include "xdec/support/bits.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 #include "algebra_idioms.h"
 

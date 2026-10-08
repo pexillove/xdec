@@ -75,6 +75,10 @@ struct Fixture {
   return count;
 }
 
+[[nodiscard]] bool contains(const std::string& text, std::string_view needle) {
+  return text.find(needle) != std::string::npos;
+}
+
 }  // namespace
 
 TEST_CASE(
@@ -169,6 +173,28 @@ TEST_CASE(
   // comparison a second time.
   CHECK(occurrences(text, "== 0x0") == 1);
   CHECK(occurrences(text, "_cse0 = ") == 1);
+}
+
+TEST_CASE("a shared pointer offset materializes as a pointer temporary",
+          "[emit][expr-reuse]") {
+  Fixture f;
+  const ExprId address = f.function.binary(
+      ExprOp::Add, f.entryReg("x0"), f.i64(8));
+  // The load proves x0 is pointer-shaped. The call then references the same
+  // offset twice inside one expression scope, which is where CSE applies.
+  f.function.appendLoad(f.entry, 0x1000, Type::integer(32), address);
+  const il::OpId call =
+      f.function.appendCall(f.entry, 0x1004, f.i64(0x5000));
+  f.function.setOperands(
+      call, std::vector<ExprId>{f.i64(0x5000), address, address});
+  f.function.appendReturn(f.entry, 0x1008);
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "uint8_t* _cse0;"));
+  CHECK(contains(text, "_cse0 = ((uint8_t*)(arg1) + 0x8);"));
+  CHECK(!contains(text, "uint64_t _cse0;"));
+  CHECK(!contains(text, "(uint64_t)(_cse0)"));
 }
 
 TEST_CASE(

@@ -1,0 +1,75 @@
+// Mach IPC and MIG wire layouts layered on types/presets/ios-sdk.hdecl.
+// MIG messages use four-byte packing even on arm64.
+
+typedef uint32_t mach_port_seqno_t;
+typedef uint32_t mach_msg_trailer_type_t;
+typedef uint32_t mach_msg_trailer_size_t;
+
+typedef struct {
+  uint32_t val[2];
+} security_token_t;
+
+typedef union {
+  uint32_t val[8];
+  uint8_t bytes[32];
+} audit_token_t;
+
+typedef struct __attribute__((packed)) {
+  mach_msg_trailer_type_t msgh_trailer_type;
+  mach_msg_trailer_size_t msgh_trailer_size;
+  mach_port_seqno_t msgh_seqno;
+  security_token_t msgh_sender;
+  audit_token_t msgh_audit;
+} mach_msg_audit_trailer_t;
+
+typedef struct {
+  uint8_t deallocate;
+  uint8_t copy;
+  uint8_t pad1;
+  uint8_t type;
+} mach_msg_descriptor_flags_t;
+
+typedef union {
+  mach_msg_descriptor_flags_t fields;
+  uint32_t value;
+} mach_msg_descriptor_word_t;
+
+typedef struct __attribute__((packed)) {
+  uint64_t address;
+  mach_msg_descriptor_word_t flags;
+  mach_msg_size_t size;
+} mach_msg_ool_descriptor_wire_t;
+
+typedef struct __attribute__((packed)) {
+  mach_msg_size_t descriptor_count;
+  mach_msg_ool_descriptor_wire_t descriptor;
+  NDR_record_t NDR;
+  mach_msg_size_t count;
+} mig_complex_body_1ool_t;
+
+typedef struct __attribute__((packed)) {
+  NDR_record_t NDR;
+  kern_return_t RetCode;
+} mig_error_body_t;
+
+typedef struct __attribute__((packed)) {
+  mach_msg_header_t Head;
+  NDR_record_t NDR;
+  kern_return_t RetCode;
+} mig_reply_error_t;
+
+typedef union {
+  mig_complex_body_1ool_t complex;
+  mig_error_body_t error;
+} mig_body_1ool_t;
+
+typedef struct __attribute__((packed)) {
+  mach_msg_header_t Head;
+  mig_body_1ool_t body;
+  mach_msg_audit_trailer_t trailer;
+} mach_msg_rcv_buf_1ool_audit_t;
+
+typedef struct __attribute__((packed)) {
+  mach_msg_header_t Head;
+  mig_body_1ool_t body;
+} mig_reply_buf_1ool_t;

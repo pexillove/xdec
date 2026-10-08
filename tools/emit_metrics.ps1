@@ -38,6 +38,17 @@ $report = [ordered]@{
   t_from_var      = ([regex]::Matches($text, '(?m)^\s*t\d+\s*=\s*var_[0-9a-f]+;')).Count
   # Shape G: a non-stack-slot memory read materialized into a plain temp.
   t_from_load     = ([regex]::Matches($text, '(?m)^\s*t\d+\s*=\s*\(\*\(')).Count
+  # Address/cast readability metrics (AFC shapes M/N). These intentionally
+  # count printed spelling rather than IL nodes: pointer provenance and CSE
+  # declaration choices only exist after emission.
+  typed_cast_total = ([regex]::Matches($text, '\(\((?:u?int(?:8|16|32|64|128)_t|bool)\)\(')).Count
+  param_uint64_casts = ([regex]::Matches(
+      $text, '\(uint64_t\)\((?:arg\d+|request|reply)\)')).Count
+  raw_offset_derefs = ([regex]::Matches(
+      $text, '\(\*\([^)]*\*\)\(\(\(uint64_t\)\(')).Count
+  address_cse = ([regex]::Matches(
+      $text, '(?m)^\s*_cse\d+\s*=\s*\(\(uint64_t\)\(')).Count
+  bool_casts = ([regex]::Matches($text, '\(\(bool\)\(')).Count
   write_only_vars = 0
   # Shape I2: distinct `_cseN = <expr>;` right-hand sides that recur under a
   # different _cseN elsewhere in the file -- each scope's own beginScope

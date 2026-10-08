@@ -33,6 +33,10 @@ enum class DiagCode : uint16_t {
   /// A budget (time, node count, iteration count) was exhausted.
   AnalysisLimit,
   PluginError,
+  /// The job was cancelled (obs::Job::requestCancel, a second Ctrl+C).
+  Cancelled,
+  /// The job's hard deadline passed (see obs/job.h).
+  Timeout,
 };
 
 [[nodiscard]] std::string_view toString(DiagCode code) noexcept;

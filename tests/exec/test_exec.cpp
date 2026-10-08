@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <sstream>
 #include <vector>
 
 #include "spec/spec_test_support.h"
@@ -460,14 +459,14 @@ TEST_CASE("failed inline handlers suspend without replaying the boundary",
 TEST_CASE("trace sinks are storage independent", "[exec]") {
   auto memory = codeMemory({0xd2800020, 0xd65f03c0});
   xdec::exec::MachineState state{engine().program().registers, 0x1000};
-  std::ostringstream text;
-  xdec::exec::TextTraceSink sink{text};
+  xdec::exec::VectorTraceSink trace;
   xdec::exec::ExecSession session{engine(), memory, std::move(state)};
-  session.setObserver(&sink);
+  session.setObserver(&trace);
 
   CHECK(session.run().stop == xdec::exec::SessionStop::Returned);
-  CHECK(text.str().find("0x1000") != std::string::npos);
-  CHECK(text.str().find("mov") != std::string::npos);
+  REQUIRE(trace.instructions.size() == 2);
+  CHECK(trace.instructions[0].pc == 0x1000);
+  CHECK(trace.instructions[0].disassembly.find("mov") != std::string::npos);
 }
 
 TEST_CASE("syscalls are external models with explicit memory effects",

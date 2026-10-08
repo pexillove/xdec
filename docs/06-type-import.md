@@ -79,6 +79,27 @@ field offset is a number the emitter can match a load against.
 parser alone, which is how a header gets checked before a decompilation depends
 on it. `--types` takes the same arguments, repeatably.
 
+### Platform preset bundles
+
+`ios-sdk` is a public bundle name, not a request to load only
+`types/presets/ios-sdk.hdecl`. It expands, in dependency order, to the core
+header plus the shipped libSystem, POSIX, CoreFoundation-extension, and Mach
+IPC layers. An AArch64 Mach-O selects that bundle automatically. Its import
+table then selects the optional Security, unified-logging, and private-SPI
+layers when symbols from those frameworks are present.
+
+Explicit project headers are overlays on the inferred platform preset:
+
+```text
+xdec decompile stripped-daemon 0x1000 --types daemon-symbols.hdecl
+```
+
+still loads `ios-sdk` first. A project header should therefore bind stripped
+function names and describe genuinely project-private payloads; it should not
+copy public Mach/MIG wire layouts. This keeps one verified `packed` definition
+of trailers and descriptors useful to every iOS daemon rather than one
+slightly different copy per reverse-engineering project.
+
 ## The binder: only exact symbols
 
 A database on its own names nothing. `TypeBinder` is the only place a

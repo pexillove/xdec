@@ -123,6 +123,9 @@ class SymPool {
  private:
   [[nodiscard]] SymId intern(const SymNode& node);
   [[nodiscard]] uint32_t internSymbol(std::string_view name);
+  [[nodiscard]] bool subtrahendOf(SymId candidate, SymId term,
+                                  SymId& result) const;
+  [[nodiscard]] bool addendBesides(SymId sum, SymId term, SymId& result) const;
 
   HandleVector<SymId, SymNode> nodes_;
   std::unordered_map<SymNode, SymId> index_;

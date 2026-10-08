@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,38 +15,91 @@
 
 #include "common.h"
 #include "options.h"
+#include "run_context.h"
 #include "session.h"
 #include "xdec/analysis/dispatch_region.h"
 #include "xdec/analysis/emit_redundancy.h"
+#include "xdec/analysis/execution_coverage.h"
 #include "xdec/analysis/expr_reuse.h"
 #include "xdec/analysis/path_explorer.h"
 #include "xdec/analysis/profile.h"
 #include "xdec/decompile/driver.h"
 #include "xdec/decompile/emit.h"
 #include "xdec/il/printer.h"
-#include "xdec/pass/manager.h"
 #include "xdec/pass/observe.h"
 #include "xdec/pass/registry.h"
 #include "xdec/passes/builtin.h"
 #include "xdec/plugin/loader.h"
+#include "xdec/obs/span.h"
 #include "xdec/spec/lift.h"
-#include "xdec/support/log.h"
+#include "xdec/storage/tracedb.h"
+#include "xdec/support/json.h"
 #include "xdec/types/syscall_table.h"
 
 namespace xdec::cli {
 
-/// Times a CLI-only diagnostic (`--reuse-report`/`--emit-report`) under the
-/// same "emit" category decompileToC's own internal stages log under (see
-/// xdec/decompile/emit.h) -- one category for the whole analyse-and-emit
-/// tail, whichever side of the library boundary a given stage now lives on.
+/// Times a CLI-only diagnostic (`--reuse-report`/`--emit-report`) as an
+/// "emit" span, like decompileToC's own stages (see xdec/decompile/emit.h).
 template <class Fn>
 auto timed(std::string_view stage, Fn&& fn) {
-  const auto started = std::chrono::steady_clock::now();
-  auto out = std::forward<Fn>(fn)();
-  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - started);
-  XDEC_LOG_DEBUG(xdec::decompile::emitLog(), "{:>16} {:>6}ms", stage, elapsed.count());
-  return out;
+  const xdec::obs::Span span{"emit", std::string{stage}};
+  return std::forward<Fn>(fn)();
+}
+
+/// The driver's half of the run report, shared by observe and decompile.
+[[nodiscard]] xdec::json::Value driverSection(const xdec::decompile::DriverReport& report,
+                                              const xdec::il::Function& function) {
+  return xdec::json::Value::object({
+      {"stop", std::string{xdec::decompile::toString(report.stop)}},
+      {"wind_down_reason", report.windDownReason},
+      {"converged", report.converged},
+      {"rounds", static_cast<uint64_t>(report.rounds)},
+      {"settles", static_cast<uint64_t>(report.settles)},
+      {"extra_entries", static_cast<uint64_t>(report.extraEntries.size())},
+      {"blocks", static_cast<uint64_t>(function.blockCount())},
+      {"ops", static_cast<uint64_t>(function.opCount())},
+      {"exprs", static_cast<uint64_t>(function.exprCount())},
+      {"unreachable_blocks", static_cast<uint64_t>(report.unreachableBlocks)},
+      {"trace_covered", report.traceCovered},
+      {"trace_instruction_addresses",
+       static_cast<uint64_t>(report.traceInstructionCount)},
+  });
+}
+
+/// "partial" for every way the driver can stop short of a fixpoint.
+void recordDriverOutcome(const xdec::decompile::DriverReport& report) {
+  RunContext* run = RunContext::current();
+  if (run == nullptr) {
+    return;
+  }
+  using xdec::decompile::DriverStop;
+  if (report.traceCovered || report.stop == DriverStop::RoundCap ||
+      report.stop == DriverStop::WindDown ||
+      report.stop == DriverStop::StuckResolution) {
+    run->setOutcome("partial");
+  }
+}
+
+[[nodiscard]] std::string driverSummary(const xdec::decompile::DriverReport& report,
+                                        std::size_t blocks) {
+  using xdec::decompile::DriverStop;
+  std::string why;
+  switch (report.stop) {
+    case DriverStop::RoundCap:
+      why = " (round cap reached; coverage may be partial)";
+      break;
+    case DriverStop::WindDown:
+      why = std::format(" (wound down on {}; coverage may be partial)", report.windDownReason);
+      break;
+    case DriverStop::StuckResolution:
+      why = " (a resolved target never became a block; coverage may be partial)";
+      break;
+    case DriverStop::Converged:
+    case DriverStop::NoDiscovery:
+      break;
+  }
+  return std::format("driver: {} round(s), {} settle(s), {} extra entrie(s), {} block(s) total{}",
+                     report.rounds, report.settles, report.extraEntries.size(), blocks, why);
 }
 
 /// Lifts a whole function by recursive descent and runs the pass pipeline
@@ -72,20 +126,20 @@ int commandObserve(std::string_view path, uint64_t address, std::span<const std:
     if (option == "--to") {
       const std::string_view text = value();
       if (!xdec::il::parseMaturity(text, target)) {
-        print("error: '{}' is not a maturity level", text);
+        printError("'{}' is not a maturity level", text);
         return 1;
       }
     } else if (option == "--out") {
       outDir = std::filesystem::path{std::string{value()}};
     } else if (option == "--rounds") {
       if (!parseRoundCap(value(), roundCap)) {
-        print("error: '{}' is not a usable round cap", value());
+        printError("'{}' is not a usable round cap", value());
         return 1;
       }
     } else if (option == "--plugin") {
       pluginPaths.emplace_back(value());
     } else {
-      print("error: unknown observe option '{}'", option);
+      printError("unknown observe option '{}'", option);
       return 1;
     }
   }
@@ -111,7 +165,7 @@ int commandObserve(std::string_view path, uint64_t address, std::span<const std:
     if (!plugin) {
       return reportError(plugin.error());
     }
-    print("plugin: {} ({} pass(es) so far)", pluginPath, registry.size());
+    note("plugin: {} ({} pass(es) so far)", pluginPath, registry.size());
     plugins.push_back(std::move(*plugin));
   }
 
@@ -134,11 +188,17 @@ int commandObserve(std::string_view path, uint64_t address, std::span<const std:
     return reportError(*observer.failure());
   }
   const xdec::il::Function& function = *result->function;
-  print("driver: {} round(s), {} extra entrie(s), {} block(s) total{}", result->report.rounds,
-        result->report.extraEntries.size(), function.blockCount(),
-        result->report.converged ? "" : " (round cap reached; coverage may be partial)");
-  print("profile: {}", xdec::analysis::profile(function).format());
-  print("observe dumps in '{}'", outDir.string());
+  note("{}", driverSummary(result->report, function.blockCount()));
+  recordDriverOutcome(result->report);
+  if (RunContext* run = RunContext::current(); run != nullptr) {
+    run->setSection("observe",
+                    xdec::json::Value::object({{"address", std::format("{:#x}", address)},
+                                               {"input", std::string{path}},
+                                               {"out_dir", outDir.string()},
+                                               {"driver", driverSection(result->report, function)}}));
+  }
+  note("profile: {}", xdec::analysis::profile(function).format());
+  note("observe dumps in '{}'", outDir.string());
   return 0;
 }
 
@@ -196,6 +256,7 @@ int commandObserve(std::string_view path, uint64_t address, std::span<const std:
 int commandDecompile(std::string_view path, uint64_t address,
                      std::span<const std::string_view> options) {
   std::filesystem::path outPath;
+  std::filesystem::path enginePath;
   RoundCap roundCap;
   bool annotate = true;
   bool allowUnresolved = false;
@@ -237,9 +298,11 @@ int commandDecompile(std::string_view path, uint64_t address,
     };
     if (option == "-o" || option == "--out") {
       outPath = std::filesystem::path{std::string{value()}};
+    } else if (option == "--engine") {
+      enginePath = std::filesystem::path{std::string{value()}};
     } else if (option == "--rounds") {
       if (!parseRoundCap(value(), roundCap)) {
-        print("error: '{}' is not a usable round cap", value());
+        printError("'{}' is not a usable round cap", value());
         return 1;
       }
     } else if (option == "--no-annotate") {
@@ -255,13 +318,13 @@ int commandDecompile(std::string_view path, uint64_t address,
     } else if (option == "--max-span") {
       const std::string_view text = value();
       if (!parseNumber(text, maxSpan) || maxSpan == 0) {
-        print("error: '--max-span' takes a byte count above zero, not '{}'", text);
+        printError("'--max-span' takes a byte count above zero, not '{}'", text);
         return 1;
       }
     } else if (option == "--discovery-cap") {
       const std::string_view text = value();
       if (!parseNumber(text, discoveryCap) || discoveryCap == 0) {
-        print("error: '--discovery-cap' takes a target count above zero, not '{}'", text);
+        printError("'--discovery-cap' takes a target count above zero, not '{}'", text);
         return 1;
       }
     } else if (option == "--no-path-explore") {
@@ -270,7 +333,7 @@ int commandDecompile(std::string_view path, uint64_t address,
       const std::string_view text = value();
       uint64_t maxPaths = 0;
       if (!parseNumber(text, maxPaths) || maxPaths == 0) {
-        print("error: '--path-explore-max-paths' takes a count above zero, not '{}'", text);
+        printError("'--path-explore-max-paths' takes a count above zero, not '{}'", text);
         return 1;
       }
       pathExplore.maxPaths = static_cast<unsigned>(maxPaths);
@@ -291,7 +354,7 @@ int commandDecompile(std::string_view path, uint64_t address,
       } else if (text == "reg") {
         indexedArgumentNames = false;
       } else {
-        print("error: '--arg-naming' takes 'indexed' or 'reg', not '{}'", text);
+        printError("'--arg-naming' takes 'indexed' or 'reg', not '{}'", text);
         return 1;
       }
     } else if (option == "--security-hints") {
@@ -301,11 +364,11 @@ int commandDecompile(std::string_view path, uint64_t address,
       } else if (text == "keep") {
         securityHintsAsComments = false;
       } else {
-        print("error: '--security-hints' takes 'comment' or 'keep', not '{}'", text);
+        printError("'--security-hints' takes 'comment' or 'keep', not '{}'", text);
         return 1;
       }
     } else {
-      print("error: unknown decompile option '{}'", option);
+      printError("unknown decompile option '{}'", option);
       return 1;
     }
   }
@@ -334,16 +397,42 @@ int commandDecompile(std::string_view path, uint64_t address,
   driverOptions.sealUnresolvedBranches = allowUnresolved;
   driverOptions.maxDiscoveryPerBranch = static_cast<std::size_t>(discoveryCap);
   driverOptions.pathExplore = pathExplore;
+  std::optional<xdec::analysis::ExecutionCoverage> executionCoverage;
+  if (!enginePath.empty()) {
+    auto database = xdec::storage::Tracedb::open(enginePath);
+    if (!database) {
+      return reportError(database.error());
+    }
+    xdec::analysis::CoverageSelection selection;
+    selection.functionTarget = address;
+    selection.imageBase = image.memory().lowestAddress();
+    auto loaded =
+        xdec::analysis::ExecutionCoverage::load(*database, selection);
+    if (!loaded) {
+      return reportError(loaded.error());
+    }
+    if (loaded->invocations().empty()) {
+      printError("tracedb contains no invocation of function {:#x}", address);
+      return 1;
+    }
+    executionCoverage.emplace(std::move(*loaded));
+    driverOptions.executionCoverage = &*executionCoverage;
+    driverOptions.pathExplore.enabled = false;
+    note("tracedb: {} invocation(s), {} executed instruction address(es)",
+         executionCoverage->invocations().size(),
+         executionCoverage->instructionCount());
+  }
   const xdec::binary::Symbol* entrySymbol = image.symbolAt(address);
   const bool sized = entrySymbol != nullptr && entrySymbol->size != 0;
-  if (maxSpan != 0) {
+  if (enginePath.empty() && maxSpan != 0) {
     // An explicit bound outranks whatever the symbol table says, and is the
     // only thing that makes a fence binding: the caller is describing the work
     // it wants done, not the function's real extent.
     driverOptions.fence = {address, address + maxSpan, /*enforce=*/true};
-  } else if (sized) {
+  } else if (enginePath.empty() && sized) {
     driverOptions.fence = {address, address + entrySymbol->size};
-  } else if (const std::optional<uint64_t> next = nextSymbolAfter(image, address)) {
+  } else if (enginePath.empty()) {
+    if (const std::optional<uint64_t> next = nextSymbolAfter(image, address)) {
     // No sized symbol here, but the next one along is still a fact about the
     // image: whatever this function is, it stops before the next thing with a
     // name. Advisory like any other inferred fence -- it only feeds the
@@ -351,16 +440,18 @@ int commandDecompile(std::string_view path, uint64_t address,
     // those diagnostics having something to compare against and having
     // nothing, which is the state absd's LC_MAIN entry (which carries no
     // symbol of its own) was in.
-    driverOptions.fence = {address, *next};
+      driverOptions.fence = {address, *next};
+    }
   }
-  if (maxSpan == 0 && !sized && !looksLikePrologue(engine, image, address)) {
+  if (enginePath.empty() && maxSpan == 0 && !sized &&
+      !looksLikePrologue(engine, image, address)) {
     // No symbol of its own, and the entry does not look like a function start
     // either: exactly the shape that let sub_627ac silently balloon into 1349
     // discovered addresses and 44k lines. Warn, rather than fail -- an unusual
     // but real entry (a hand-written trampoline, a prologue-less leaf) is
     // still worth decompiling, just not silently mistaken for one when it
     // might not be.
-    print("warning: {:#x} has no symbol and its first instruction does not look like a "
+    warn("{:#x} has no symbol and its first instruction does not look like a "
           "function prologue; if this address is inside another function's body (a "
           "jump-table target, say) rather than a real entry, discovery has no function "
           "size to stay inside and this run may pull in unrelated code",
@@ -388,9 +479,8 @@ int commandDecompile(std::string_view path, uint64_t address,
     return reportError(result.error());
   }
   const xdec::il::Function& function = *result->function;
-  print("driver: {} round(s), {} extra entrie(s), {} block(s) total{}", result->driverReport.rounds,
-        result->driverReport.extraEntries.size(), function.blockCount(),
-        result->driverReport.converged ? "" : " (round cap reached; coverage may be partial)");
+  note("{}", driverSummary(result->driverReport, function.blockCount()));
+  recordDriverOutcome(result->driverReport);
   if (reuseReport) {
     const xdec::analysis::ExpressionReuseReport reuse =
         timed("reuse-report", [&] { return xdec::analysis::analyzeExpressionReuse(function); });
@@ -435,19 +525,49 @@ int commandDecompile(std::string_view path, uint64_t address,
     }
   }
 
-  print("emit: {} argument(s), {} local(s), {} temp(s), {} labeled block(s)",
-        result->variables.arguments().size(), result->variables.locals().size(),
-        result->variables.temps().size(), result->structured.labeled.size());
+  note("emit: {} argument(s), {} local(s), {} temp(s), {} labeled block(s)",
+       result->variables.arguments().size(), result->variables.locals().size(),
+       result->variables.temps().size(), result->structured.labeled.size());
+
+  if (RunContext* run = RunContext::current(); run != nullptr) {
+    std::vector<xdec::json::Value> stages;
+    for (const auto& stage : result->report.stageTimings) {
+      stages.push_back(xdec::json::Value::object(
+          {{"stage", std::string{stage.stage}},
+           {"ms", static_cast<int64_t>(stage.elapsed.count())}}));
+    }
+    std::error_code sizeError;
+    const auto inputSize = std::filesystem::file_size(std::filesystem::path{path}, sizeError);
+    run->setSection(
+        "decompile",
+        xdec::json::Value::object({
+            {"address", std::format("{:#x}", address)},
+            {"input", std::string{path}},
+            {"input_bytes", static_cast<uint64_t>(sizeError ? 0 : inputSize)},
+            {"output", outPath.string()},
+            {"output_bytes", static_cast<uint64_t>(result->cSource.size())},
+            {"driver", driverSection(result->driverReport, function)},
+            {"emit", xdec::json::Value::object({
+                         {"arguments", static_cast<uint64_t>(result->variables.arguments().size())},
+                         {"locals", static_cast<uint64_t>(result->variables.locals().size())},
+                         {"temps", static_cast<uint64_t>(result->variables.temps().size())},
+                         {"labeled_blocks",
+                          static_cast<uint64_t>(result->structured.labeled.size())},
+                         {"stages", xdec::json::Value::array(std::move(stages))},
+                     })},
+        }));
+  }
+
   if (outPath.empty()) {
     print("{}", result->cSource);
   } else {
     std::ofstream stream(outPath, std::ios::binary | std::ios::trunc);
     if (!stream) {
-      print("error: cannot open '{}' for writing", outPath.string());
+      printError("cannot open '{}' for writing", outPath.string());
       return 1;
     }
     stream << result->cSource;
-    print("wrote '{}' ({} bytes)", outPath.string(), result->cSource.size());
+    note("wrote '{}' ({} bytes)", outPath.string(), result->cSource.size());
   }
   return 0;
 }

@@ -158,6 +158,48 @@ TEST_CASE("real Advanced SIMD integer words select exact semantics", "[spec][eng
   }
 }
 
+TEST_CASE("encodings reached by a shipping binary leave the catch-alls",
+          "[spec][engine][simd]") {
+  // Every word below was found by decoding each instruction-bearing word of a
+  // production arm64 executable and keeping the ones only a catch-all claimed.
+  // The first of them stopped a live trace, so the whole set is pinned here.
+  CHECK(ruleOf(0x4e080eda) == "neon_dup_gpr_d");    // dup v26.2d, x22
+  CHECK(ruleOf(0x6e180528) == "neon_ins_elem_d");   // mov v8.d[1], v9.d[0]
+  CHECK(ruleOf(0x4e0c1d31) == "neon_ins_gpr_s");    // mov v17.s[1], w9
+  CHECK(ruleOf(0x4ea09800) == "neon_cmeq_zero_4s"); // cmeq v0.4s, v0.4s, #0
+  CHECK(ruleOf(0x0ea008a5) == "neon_rev64_2s");     // rev64 v5.2s, v5.2s
+  CHECK(ruleOf(0x6eae45ee) == "neon_ushl_4s");      // ushl v14.4s, v15.4s, v14.4s
+  CHECK(ruleOf(0x6ea0ba12) == "neon_neg_4s");       // neg v18.4s, v16.4s
+  CHECK(ruleOf(0x4ea09611) == "neon_mla_4s");       // mla v17.4s, v16.4s, v0.4s
+  CHECK(ruleOf(0x0f0795f1) == "neon_orr_imm_16");   // orr v17.4h, #0xef
+  CHECK(ruleOf(0x6f02141a) == "neon_bic_imm_32");   // bic v26.4s, #0x40
+
+  SECTION("the load and store forms it also reached") {
+    CHECK(ruleOf(0x38ee69ee) == "ldrsb32_reg_offset"); // ldrsb w14, [x15, x14]
+    CHECK(ruleOf(0x98267967) == "ldrsw_literal");      // ldrsw x7, #0x4cf2c
+    CHECK(ruleOf(0xac50a224) == "ldnp_fp");            // ldnp q4, q8, [x17, #0x210]
+    CHECK(ruleOf(0xd83cf9a5) == "prfm_literal");       // prfm pldl3strm, #...
+  }
+
+  SECTION("the narrow and pair exclusives complete their matrix") {
+    // Assembled rather than taken from the binary: the words the audit found
+    // have non-architectural Rs and Rt2 fields, so they are literal pool data
+    // that only looks like an exclusive, and they must stay in the catch-all.
+    CHECK(ruleOf(0x08007c41) == "stxrb");   // stxrb w0, w1, [x2]
+    CHECK(ruleOf(0x48007c41) == "stxrh");   // stxrh w0, w1, [x2]
+    CHECK(ruleOf(0x4800fc41) == "stlxrh");  // stlxrh w0, w1, [x2]
+    CHECK(ruleOf(0x085f7c41) == "ldxrb");   // ldxrb w1, [x2]
+    CHECK(ruleOf(0x485f7c41) == "ldxrh");   // ldxrh w1, [x2]
+    CHECK(ruleOf(0x485ffc41) == "ldaxrh");  // ldaxrh w1, [x2]
+    CHECK(ruleOf(0xc87f8440) == "ldaxp");   // ldaxp x0, x1, [x2]
+    CHECK(ruleOf(0xc8200861) == "stxp");    // stxp w0, x1, x2, [x3]
+
+    CHECK(ruleOf(0x4814a5ac) == "memory_unmodelled");
+    CHECK(ruleOf(0x08026f59) == "memory_unmodelled");
+    CHECK(ruleOf(0xc878fd8d) == "memory_unmodelled");
+  }
+}
+
 TEST_CASE("fuzz-found over-decodes stay undecodable", "[spec][engine]") {
   // Every word here was decoded by xdec and rejected by capstone in a
   // fuzz_decode.py run; each exposed a missing encoding constraint. The tests
@@ -624,6 +666,91 @@ TEST_CASE("lifted NEON lane shifts do not leak across lanes", "[spec][engine][si
   const xdec::il::ConcreteValue result = interpreter.readRegister(q0);
   CHECK(result.lo == 0x1000000000000001);
   CHECK(result.hi == 0x1000000000000001);
+}
+
+TEST_CASE("full-width SIMD constants reach the upper half", "[spec][engine][simd][exec]") {
+  // An xspec integer is 64 bits, so a rule that asks for a 128-bit splat in one
+  // step gets a 64-bit one that is then zero-extended. Such a rule decodes,
+  // disassembles and reads correctly, and is wrong only in the half nobody
+  // looks at -- which is why each of these is pinned by the value it computes
+  // rather than by the rule it selects.
+  const auto run = [](uint32_t word, xdec::il::ConcreteValue input) {
+    xdec::il::Function function{engine().program().arch,
+                                engine().program().registers, 0x1000};
+    const xdec::il::BlockId block = function.createBlock(0x1000);
+    function.setEntryBlock(block);
+
+    xdec::spec::LiftSite site;
+    site.function = &function;
+    site.block = block;
+    site.address = 0x1000;
+    site.blockAt = [&](uint64_t) { return block; };
+    REQUIRE(engine().elaborate(decode(word, 0x1000), site));
+    function.appendReturn(block, 0x1004);
+
+    xdec::il::Interpreter interpreter{function};
+    const xdec::il::RegId q1 = function.registers().find("q1");
+    REQUIRE(q1.valid());
+    interpreter.writeRegister(q1, input);
+    REQUIRE(interpreter.runBlock(block).stop == xdec::il::ExecStop::Return);
+    return interpreter;
+  };
+
+  SECTION("movi replicates the byte across all sixteen") {
+    // The word a shipping arm64 binary uses to build an all-0x93 multiplier.
+    // Leaving the upper half zero turns the multiply that follows into a
+    // silent zeroing of half its result.
+    xdec::il::Interpreter interpreter = run(0x4f04e665, {0, 0});
+    const xdec::il::RegId q5 = interpreter.function().registers().find("q5");
+    REQUIRE(q5.valid());
+    const xdec::il::ConcreteValue result = interpreter.readRegister(q5);
+    CHECK(result.lo == 0x9393939393939393);
+    CHECK(result.hi == 0x9393939393939393);
+  }
+
+  SECTION("the narrow movi still clears the upper half") {
+    xdec::il::Interpreter interpreter = run(0x0f04e665, {0, 0});
+    const xdec::il::RegId q5 = interpreter.function().registers().find("q5");
+    REQUIRE(q5.valid());
+    const xdec::il::ConcreteValue result = interpreter.readRegister(q5);
+    CHECK(result.lo == 0x9393939393939393);
+    CHECK(result.hi == 0);
+  }
+
+  SECTION("fabs clears the sign of every lane, not just the low two") {
+    // -1.0f in all four lanes.
+    xdec::il::Interpreter interpreter =
+        run(0x4ea0f820, {0xbf800000bf800000, 0xbf800000bf800000});
+    const xdec::il::RegId q0 = interpreter.function().registers().find("q0");
+    REQUIRE(q0.valid());
+    const xdec::il::ConcreteValue result = interpreter.readRegister(q0);
+    CHECK(result.lo == 0x3f8000003f800000);
+    CHECK(result.hi == 0x3f8000003f800000);
+  }
+
+  SECTION("fneg flips the sign of every lane, not just the low two") {
+    xdec::il::Interpreter interpreter =
+        run(0x6ea0f820, {0x3f8000003f800000, 0x3f8000003f800000});
+    const xdec::il::RegId q0 = interpreter.function().registers().find("q0");
+    REQUIRE(q0.valid());
+    const xdec::il::ConcreteValue result = interpreter.readRegister(q0);
+    CHECK(result.lo == 0xbf800000bf800000);
+    CHECK(result.hi == 0xbf800000bf800000);
+  }
+
+  SECTION("the narrow fabs and fneg forms still clear the upper half") {
+    xdec::il::Interpreter fabs =
+        run(0x0ea0f820, {0xbf800000bf800000, 0xbf800000bf800000});
+    const xdec::il::RegId q0 = fabs.function().registers().find("q0");
+    REQUIRE(q0.valid());
+    CHECK(fabs.readRegister(q0).lo == 0x3f8000003f800000);
+    CHECK(fabs.readRegister(q0).hi == 0);
+
+    xdec::il::Interpreter fneg =
+        run(0x2ea0f820, {0x3f8000003f800000, 0x3f8000003f800000});
+    CHECK(fneg.readRegister(q0).lo == 0xbf800000bf800000);
+    CHECK(fneg.readRegister(q0).hi == 0);
+  }
 }
 
 TEST_CASE("a write to the zero register is discarded", "[spec][engine]") {

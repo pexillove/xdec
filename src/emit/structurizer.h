@@ -140,6 +140,11 @@ class Structurizer {
   /// `trySplitSkipGoto`, structure.cpp, uses for its own promoted content).
   void simplifyGuardedSpins(StmtPtr& node);
 
+  /// Turns `if (valid) { WORK-that-leaves; } ERROR-that-leaves;` into the
+  /// guard form `if (!valid) { ERROR; } WORK;`. Repeating this over nested
+  /// validation chains keeps the successful path flat.
+  void flattenEarlyExitGuards(StmtPtr& node);
+
   /// `simplifyGuardedSpins`'s own per-`While` check and rewrite. Returns the
   /// `WORK` arm to splice in after `whileStmt` on a match, leaving
   /// `whileStmt` itself as a plain `while (cond) {}`; null when `whileStmt`

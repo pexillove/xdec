@@ -2,9 +2,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <format>
+#include <optional>
 
 #include "xdec/il/verify.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/context.h"
+#include "xdec/obs/job.h"
+#include "xdec/obs/log.h"
+#include "xdec/obs/metrics.h"
+#include "xdec/obs/span.h"
 
 namespace xdec::pass {
 
@@ -15,6 +21,8 @@ namespace xdec::pass {
 // which is not answerable from the outside, because the pipeline reports nothing
 // until it is done. Set XDEC_LOG=pass=debug for a line per pass.
 XDEC_DEFINE_LOG_CATEGORY(passLog, "pass")
+XDEC_DEFINE_COUNTER(passRuns, "pass.runs")
+XDEC_DEFINE_COUNTER(passIterations, "pass.iterations")
 
 namespace {
 
@@ -33,7 +41,8 @@ Result<std::vector<RunStats>> Manager::run(
   std::vector<RunStats> stats;
   stats.reserve(pipeline.size());
 
-  for (Pass* pass : pipeline) {
+  for (std::size_t index = 0; index < pipeline.size(); ++index) {
+    Pass* pass = pipeline[index];
     const PassInfo& info = pass->info();
 
     // The resolver checked this statically, but a hand-assembled pipeline can
@@ -67,11 +76,28 @@ Result<std::vector<RunStats>> Manager::run(
       context.setDiscoverySink(discoverySink_);
     }
     RunStats slot{.passName = info.name, .iterations = 0, .changed = false};
+    slot.blocksBefore = function.blockCount();
+    slot.opsBefore = function.opCount();
+    slot.exprsBefore = function.exprCount();
+    obs::checkpoint(info.name);
+    XDEC_LOG_CONTEXT("pass", info.name);
+    obs::reportProgress("pipeline", std::format("pass {}/{} {}", index + 1, pipeline.size(), info.name),
+                        index + 1, pipeline.size());
+    obs::Span passSpan{"pass", info.name,
+                       obs::kv("blocks", slot.blocksBefore, "ops", slot.opsBefore, "exprs",
+                               slot.exprsBefore)};
+    passRuns().add();
     const auto started = std::chrono::steady_clock::now();
     XDEC_LOG_DEBUG(passLog(), "{:>18} start {} block(s) {} op(s) {} expr(s)", info.name,
                    function.blockCount(), function.opCount(), function.exprCount());
     do {
       const auto iterationStart = std::chrono::steady_clock::now();
+      std::optional<obs::Span> iterationSpan;
+      if (info.fixpoint) {
+        iterationSpan.emplace("pass.iter", info.name, obs::kv("iteration", slot.iterations + 1));
+        obs::checkpoint(info.name);
+      }
+      passIterations().add();
       Result<bool> changed = pass->run(context);
       if (!changed) {
         // The pipeline stops here, so the failing pass names itself; without
@@ -82,6 +108,12 @@ Result<std::vector<RunStats>> Manager::run(
       }
       ++slot.iterations;
       slot.changed = slot.changed || *changed;
+      if (iterationSpan) {
+        iterationSpan->set("changed", *changed);
+        iterationSpan->set("ops", function.opCount());
+        iterationSpan->set("exprs", function.exprCount());
+        iterationSpan->end();
+      }
       if (info.fixpoint) {
         const int64_t iterationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                         std::chrono::steady_clock::now() - iterationStart)
@@ -117,18 +149,30 @@ Result<std::vector<RunStats>> Manager::run(
     } while (true);
 
     const auto ran = std::chrono::steady_clock::now();
+    slot.elapsed = ran - started;
 
     // The produced level's invariants are the pass's contract; check them
     // before anyone else builds on the result.
-    const il::VerifyReport report = il::verify(function, info.produces);
+    il::VerifyReport report;
+    {
+      const obs::Span verifySpan{"verify", info.name};
+      report = il::verify(function, info.produces);
+    }
+    slot.verifyElapsed = std::chrono::steady_clock::now() - ran;
+    slot.blocksAfter = function.blockCount();
+    slot.opsAfter = function.opCount();
+    slot.exprsAfter = function.exprCount();
+    passSpan.set("blocks_out", slot.blocksAfter);
+    passSpan.set("ops_out", slot.opsAfter);
+    passSpan.set("exprs_out", slot.exprsAfter);
+    passSpan.set("iterations", slot.iterations);
+    passSpan.set("changed", slot.changed);
     // Verification separately from the pass: it walks the whole function on
     // every pass boundary, so on a large one it can be the expensive half, and a
     // total that hides which half it was answers nothing.
     XDEC_LOG_DEBUG(passLog(), "{:>18} {:6}ms (+{:4}ms verify) {} block(s){}", info.name,
-                   std::chrono::duration_cast<std::chrono::milliseconds>(ran - started)
-                       .count(),
-                   std::chrono::duration_cast<std::chrono::milliseconds>(
-                       std::chrono::steady_clock::now() - ran)
+                   std::chrono::duration_cast<std::chrono::milliseconds>(slot.elapsed).count(),
+                   std::chrono::duration_cast<std::chrono::milliseconds>(slot.verifyElapsed)
                        .count(),
                    function.blockCount(),
                    slot.iterations > 1 ? std::format(" x{}", slot.iterations) : "");

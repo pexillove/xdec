@@ -408,7 +408,9 @@ TEST_CASE("a resolved two-target table dispatch collapses to if/else over the "
   CHECK(ifStmt->cond == branchCond);
   CHECK(!ifStmt->invertCond);
   REQUIRE(ifStmt->thenArm != nullptr);
-  REQUIRE(ifStmt->elseArm != nullptr);
+  // Both targets leave, so the false arm is promoted after the true-arm
+  // guard instead of adding a final else indentation level.
+  CHECK(ifStmt->elseArm == nullptr);
 }
 
 TEST_CASE("chained resolved two-target dispatches nest as if/else instead of "

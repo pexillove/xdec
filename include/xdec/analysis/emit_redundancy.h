@@ -26,7 +26,6 @@
 #include "xdec/analysis/load_inline.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/stack_load_fold.h"
-#include "xdec/analysis/stack_store_fold.h"
 #include "xdec/analysis/variables.h"
 #include "xdec/il/function.h"
 
@@ -65,6 +64,10 @@ struct EmitRedundancyReport {
   /// completeness of the taxonomy, not as a fold this file performs: see
   /// docs/09-expression-reuse.md section J.
   std::optional<std::size_t> dispatcherRelayUnneededSlots;
+  /// Cast nodes the C emitter can prove are presentation-only: same-width
+  /// casts, or zero-extensions compared for equality with a constant that
+  /// fits the source width.
+  std::size_t redundantCasts = 0;
 
   [[nodiscard]] std::string format() const;
 };

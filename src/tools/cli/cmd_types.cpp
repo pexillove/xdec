@@ -31,21 +31,21 @@ int commandTypes(std::span<const std::string_view> args) {
     const std::string_view option = args[i];
     if (option == "-o" || option == "--out") {
       if (++i >= args.size()) {
-        printLine("error: -o needs a path");
+        printError("-o needs a path");
         return 1;
       }
       outPath = std::filesystem::path{std::string{args[i]}};
     } else if (option == "--definitions") {
       definitions = true;
     } else if (option.starts_with("-")) {
-      print("error: unknown types option '{}'", option);
+      printError("unknown types option '{}'", option);
       return 1;
     } else {
       sources.emplace_back(option);
     }
   }
   if (sources.empty()) {
-    printLine("error: types parse needs at least one header or preset name");
+    printError("types parse needs at least one header or preset name");
     return 1;
   }
 
@@ -63,11 +63,11 @@ int commandTypes(std::span<const std::string_view> args) {
     const std::string text = database->toJson().dump();
     std::ofstream stream(outPath, std::ios::binary | std::ios::trunc);
     if (!stream) {
-      print("error: cannot open '{}' for writing", outPath.string());
+      printError("cannot open '{}' for writing", outPath.string());
       return 1;
     }
     stream << text;
-    print("wrote '{}' ({} bytes)", outPath.string(), text.size());
+    note("wrote '{}' ({} bytes)", outPath.string(), text.size());
   }
   return 0;
 }

@@ -9,9 +9,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include "xdec/analysis/call_abi.h"
 #include "xdec/analysis/dominators.h"
 #include "xdec/il/function.h"
 
+#include "call_names.h"
 #include "transform.h"
 
 namespace xdec::passes {
@@ -35,8 +37,10 @@ struct PhiSite {
 
 class SsaBuilder {
  public:
-  SsaBuilder(il::Function& function, const analysis::Dominators& dominators)
-      : function_(function), dominators_(dominators) {
+  SsaBuilder(il::Function& function, const analysis::Dominators& dominators,
+             analysis::CallNameSources callNames)
+      : function_(function), dominators_(dominators), callNames_(std::move(callNames)) {
+    callNames_.rewrite = [this](il::ExprId id) { return subst_.apply(function_, id); };
     for (il::RegId root{0}; root.asSize() < function_.registers().size();
          root = il::RegId{root.index() + 1}) {
       const il::RegisterInfo& info = function_.registers()[root];
@@ -143,6 +147,20 @@ class SsaBuilder {
     return true;
   }
 
+  /// Asked mid-rename, so the target is read through the versions recorded so
+  /// far: everything it depends on dominates the call and is already renamed.
+  /// Def-site collection does not ask, and does not need to: counting such a
+  /// call as a definition only places a phi whose inputs all agree.
+  [[nodiscard]] bool callsRegisterPreservingHelper(const il::Op& call) {
+    const auto operands = function_.operands(call);
+    if (operands.empty()) {
+      return false;
+    }
+    const std::optional<std::string> name =
+        analysis::callTargetName(function_, operands[0], callNames_);
+    return name.has_value() && analysis::isRegisterPreservingHelper(*name);
+  }
+
   /// Cytron over the dominance frontier, per register with more than one
   /// def-site.
   void placePhis() {
@@ -220,19 +238,27 @@ class SsaBuilder {
           break;
         }
         case il::OpCode::Call: {
+          // A helper with a private contract (see analysis/call_abi.h) reads
+          // no argument register and destroys only the scratch pair, so the
+          // caller's own incoming arguments stay live across it.
+          const bool preserving = callsRegisterPreservingHelper(op);
           // The calling-convention arguments are exactly the argument
           // registers' current versions; record them before the clobber
           // below, so later stages (emission) see what was passed without
           // re-deriving SSA.
           std::vector<il::ExprId> args;
           for (const il::RegId root : argRoots_) {
-            if (versions_.contains(root)) {
+            if (!preserving && versions_.contains(root)) {
               args.push_back(current(root));
             }
           }
           callArgs_[opId] = std::move(args);
           for (const il::RegId root : roots_) {
             if (!clobbers(root)) {
+              continue;
+            }
+            if (preserving && !analysis::registerPreservingHelperClobbers(
+                                  function_.registers().nameOf(root))) {
               continue;
             }
             // The result register's new version is the call's defined value:
@@ -428,6 +454,7 @@ class SsaBuilder {
 
   il::Function& function_;
   const analysis::Dominators& dominators_;
+  analysis::CallNameSources callNames_;
   std::vector<il::RegId> roots_;
   /// Calling-convention registers, looked up by the usual names; an exotic
   /// register file simply records no arguments (emission degrades, never
@@ -462,7 +489,7 @@ class SsaConstruct final : public pass::FunctionPass {
   Result<bool> run(pass::Context& context) override {
     il::Function& function = context.function();
     const analysis::Dominators dominators = analysis::Dominators::compute(function);
-    SsaBuilder(function, dominators).build();
+    SsaBuilder(function, dominators, callNameSources(context)).build();
     return true;
   }
 };

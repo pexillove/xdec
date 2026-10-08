@@ -161,7 +161,13 @@ class ExecSession {
   // Redirect responses may enter an in-module callee. Ret instructions are
   // otherwise the public-session terminator, so retain their expected LR
   // values to resume the caller rather than ending the whole session.
-  std::vector<uint64_t> redirectedCallReturns_;
+  struct RedirectFrame {
+    uint64_t returnPc = 0;
+    // Non-zero when the model that issued the redirect asked to be called
+    // back once this frame pops. See ExternalResponse::continuationPc.
+    uint64_t continuationPc = 0;
+  };
+  std::vector<RedirectFrame> redirectedCallReturns_;
   uint64_t executed_ = 0;
   uint64_t emitted_ = 0;
   uint64_t sessionId_ = 0;

@@ -137,6 +137,13 @@ struct TypeEntry {
   /// Whether a struct/union/enum has a body yet.
   bool complete = true;
 
+  /// `__attribute__((packed))`: every member sits immediately after the one
+  /// before it, with no alignment padding anywhere. Wire formats are written
+  /// this way and read this way -- a MIG message puts a 64-bit descriptor at
+  /// a four-byte offset -- so a header that says so has to be believed, or
+  /// every field past the first hole is named at the wrong address.
+  bool packed = false;
+
   /// A typedef the platform provides rather than one an imported header
   /// declared: `size_t`, `pid_t`, `off_t`. Kept as entries, because printing
   /// `size_t` where the source said `size_t` is most of what type import is

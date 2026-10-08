@@ -1,13 +1,16 @@
 xdec_add_library(xdec_analysis
   SOURCES
+    address_expr.cpp
     analysis_cache.cpp
     atomic_exclusive.cpp
+    call_abi.cpp
     call_target.cpp
     dispatch_region.cpp
     dispatch_values.cpp
     dispatcher_shape.cpp
     dominators.cpp
     entry_reg.cpp
+    execution_coverage.cpp
     expr_reuse.cpp
     guard_cascade.cpp
     image_eval.cpp
@@ -40,5 +43,6 @@ xdec_add_library(xdec_analysis
   DEPS
     xdec_il
     xdec_spec
+    xdec_storage
     xdec_support
     xdec_types)

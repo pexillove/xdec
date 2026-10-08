@@ -86,6 +86,25 @@ StmtPtr cloneStmt(const Stmt* node) {
   return copy;
 }
 
+std::size_t statementWeight(const Stmt* node) {
+  if (node == nullptr) {
+    return 0;
+  }
+  std::size_t weight = 1;
+  for (const StmtPtr& item : node->items) {
+    weight += statementWeight(item.get());
+  }
+  weight += statementWeight(node->thenArm.get());
+  weight += statementWeight(node->elseArm.get());
+  weight += statementWeight(node->body.get());
+  for (const StmtPtr& body : node->caseBodies) {
+    weight += statementWeight(body.get());
+  }
+  weight += statementWeight(node->defaultBody.get());
+  weight += statementWeight(node->epilogue.get());
+  return weight;
+}
+
 /// Whether `node`'s tree holds a nested `Switch` anywhere -- claimOrCloneSharedCaseBody's
 /// own honesty check on top of its op-count size cap (see its own comment): a
 /// scatter-dispatcher's handler routinely does its own tiny bit of work and
@@ -650,6 +669,11 @@ StructuredFunction Structurizer::run() {
   // fallthrough goto (the merge's own tail landing on whatever runs next),
   // which is exactly what elideFallthroughGotos is for.
   restructureSkipGotos(result.root);
+
+  // Validation-heavy handlers are commonly compiled as a nest of "valid"
+  // arms followed by an error return. Prefer guards so the useful path stays
+  // at the function's normal indentation.
+  flattenEarlyExitGuards(result.root);
 
   // Phase 4 (goto-elimination plan §"J2f 扩展"): a `while (true)` whose own
   // body turned out to be nothing but `if (cond) { continue; } else { WORK
@@ -2252,6 +2276,110 @@ bool Structurizer::alwaysLeaves(const Stmt* node) const {
       return node->tableMode || (!node->caseValues.empty() && !node->addressCases);
     default:
       return false;
+  }
+}
+
+void Structurizer::flattenEarlyExitGuards(StmtPtr& node) {
+  if (!node) {
+    return;
+  }
+  for (StmtPtr& item : node->items) {
+    flattenEarlyExitGuards(item);
+  }
+  flattenEarlyExitGuards(node->thenArm);
+  flattenEarlyExitGuards(node->elseArm);
+
+  if (node->kind != StmtKind::Sequence) {
+    return;
+  }
+  for (std::size_t index = 0; index < node->items.size(); ++index) {
+    StmtPtr& candidate = node->items[index];
+    if (!candidate || candidate->kind != StmtKind::If || candidate->epilogue) {
+      continue;
+    }
+
+    if (candidate->elseArm) {
+      const bool thenLeaves = alwaysLeaves(candidate->thenArm.get());
+      const bool elseLeaves = alwaysLeaves(candidate->elseArm.get());
+      if (thenLeaves || elseLeaves) {
+        StmtPtr continuation;
+        if (thenLeaves &&
+            (!elseLeaves ||
+             statementWeight(candidate->thenArm.get()) <=
+                 statementWeight(candidate->elseArm.get()))) {
+          continuation = std::move(candidate->elseArm);
+        } else {
+          continuation = std::move(candidate->thenArm);
+          candidate->thenArm = std::move(candidate->elseArm);
+          candidate->invertCond = !candidate->invertCond;
+        }
+        if (continuation->kind == StmtKind::Sequence) {
+          node->items.insert(node->items.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                             std::make_move_iterator(continuation->items.begin()),
+                             std::make_move_iterator(continuation->items.end()));
+        } else {
+          node->items.insert(node->items.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                             std::move(continuation));
+        }
+      }
+      continue;
+    }
+
+    if (index + 1 == node->items.size()) {
+      continue;
+    }
+    auto suffix = Stmt::make(StmtKind::Sequence);
+    for (std::size_t tail = index + 1; tail < node->items.size(); ++tail) {
+      suffix->items.push_back(cloneStmt(node->items[tail].get()));
+    }
+    if (!alwaysLeaves(suffix.get())) {
+      continue;
+    }
+
+    StmtPtr continuation = std::move(candidate->thenArm);
+    const bool continuationLeaves = alwaysLeaves(continuation.get());
+    const bool continuesValidationChain =
+        continuation->kind == StmtKind::Sequence &&
+        std::any_of(continuation->items.begin(), continuation->items.end(),
+                    [](const StmtPtr& item) {
+                      return item && item->kind == StmtKind::If;
+                    });
+    if (!continuationLeaves &&
+        (!continuesValidationChain || !node->items[index + 1] ||
+         node->items[index + 1]->kind != StmtKind::Block ||
+         !node->items[index + 1]->block.valid())) {
+      candidate->thenArm = std::move(continuation);
+      continue;
+    }
+    if (continuationLeaves) {
+      candidate->thenArm = std::move(suffix);
+    } else {
+      candidate->thenArm = Stmt::make(StmtKind::Goto);
+      candidate->thenArm->block = node->items[index + 1]->block;
+    }
+    candidate->invertCond = !candidate->invertCond;
+
+    std::vector<StmtPtr> promoted;
+    if (continuation->kind == StmtKind::Sequence) {
+      for (StmtPtr& item : continuation->items) {
+        promoted.push_back(std::move(item));
+      }
+    } else {
+      promoted.push_back(std::move(continuation));
+    }
+    node->items.insert(node->items.begin() + static_cast<std::ptrdiff_t>(index + 1),
+                       std::make_move_iterator(promoted.begin()),
+                       std::make_move_iterator(promoted.end()));
+
+    if (continuationLeaves) {
+      // The success path cannot reach the original suffix, so keeping that
+      // second copy would be dead text.
+      const std::size_t suffixStart = index + 1 + promoted.size();
+      node->items.erase(node->items.begin() + static_cast<std::ptrdiff_t>(suffixStart),
+                        node->items.end());
+    }
+    // The continuation was recursively normalized before it was promoted,
+    // so the loop can move on without reconsidering (and toggling) this guard.
   }
 }
 

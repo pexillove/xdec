@@ -1,6 +1,7 @@
 #include "xdec/decompile/emit.h"
 
 #include <chrono>
+#include <format>
 #include <string_view>
 #include <utility>
 
@@ -8,6 +9,10 @@
 #include "xdec/analysis/dominators.h"
 #include "xdec/analysis/loops.h"
 #include "xdec/analysis/typed_variables.h"
+#include "xdec/obs/context.h"
+#include "xdec/obs/job.h"
+#include "xdec/obs/span.h"
+#include "xdec/support/stop.h"
 #include "xdec/types/binder.h"
 #include "xdec/types/database.h"
 #include "xdec/types/syscall_table.h"
@@ -20,26 +25,29 @@ Result<DecompileToCResult> decompileToC(const spec::SpecEngine& engine, const By
                                          uint64_t entry, pass::Registry& registry,
                                          const DecompileToCOptions& options) {
   XDEC_TRY(DriverResult driven, decompile(engine, reader, entry, registry, options.driver));
-  RenderToCResult rendered = renderToC(*driven.function, options);
-  return DecompileToCResult{std::move(driven.function),     std::move(driven.report),
-                            std::move(rendered.variables),  rendered.frame,
-                            std::move(rendered.structured), std::move(rendered.cSource),
-                            std::move(rendered.report)};
+  return catchStop([&]() -> Result<DecompileToCResult> {
+    XDEC_LOG_CONTEXT("entry", obs::hex(entry));
+    RenderToCResult rendered = renderToC(*driven.function, options);
+    return DecompileToCResult{std::move(driven.function),     std::move(driven.report),
+                              std::move(rendered.variables),  rendered.frame,
+                              std::move(rendered.structured), std::move(rendered.cSource),
+                              std::move(rendered.report)};
+  });
 }
 
 RenderToCResult renderToC(const il::Function& function, const DecompileToCOptions& options) {
   DecompileReport report;
-  // Times one stage of the analyse-and-emit tail, the same way driver.cpp
-  // times a round: on a large flattened function this is where the wall
-  // clock goes, and both a caller with XDEC_LOG=emit=debug set and a caller
-  // reading `report.stageTimings` back from the result want to see which
-  // stage -- the same measurement, kept in sync by construction rather than
-  // by two call sites agreeing to measure the same span.
+  XDEC_SPAN(renderSpan, "emit", "render", "blocks", function.blockCount());
+  // One span per stage of the analyse-and-emit tail: on a large flattened
+  // function this is where the wall clock goes. The same measurement lands in
+  // the trace, the debug log and `report.stageTimings`.
   const auto timed = [&report](std::string_view stage, auto&& fn) {
-    const auto started = std::chrono::steady_clock::now();
+    obs::checkpoint(stage);
+    obs::reportProgress("emit", std::format("emit {}", stage));
+    obs::Span span{"emit", std::string{stage}};
     auto out = std::forward<decltype(fn)>(fn)();
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - started);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(span.elapsed());
+    span.end();
     XDEC_LOG_DEBUG(emitLog(), "{:>16} {:>6}ms", stage, elapsed.count());
     report.stageTimings.push_back({stage, elapsed});
     return out;

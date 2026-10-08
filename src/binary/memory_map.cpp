@@ -5,7 +5,7 @@
 #include <format>
 #include <limits>
 
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 namespace xdec::binary {
 

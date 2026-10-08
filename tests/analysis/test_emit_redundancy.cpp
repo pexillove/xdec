@@ -70,6 +70,26 @@ TEST_CASE("a folded load and a dead store both count towards the report",
   CHECK(!report.format().empty());
 }
 
+TEST_CASE("presentation-only equality extensions count as redundant casts",
+          "[analysis][emit-redundancy]") {
+  Fixture f;
+  const ExprId byte =
+      f.function.cast(ExprOp::Trunc, Type::integer(8), f.function.entryReg(f.reg("x0")));
+  const ExprId widened = f.function.cast(ExprOp::ZExt, Type::integer(32), byte);
+  const ExprId one = f.function.constant(Type::integer(32), 1);
+  const ExprId condition = f.function.binary(ExprOp::CmpEq, widened, one);
+  f.function.appendCondBranch(f.entry, 0x1000, condition,
+                              f.function.createBlock(0x1004),
+                              f.function.createBlock(0x1008));
+  f.function.rebuildEdges();
+
+  const StackFrame frame = StackFrame::compute(f.function);
+  const VariableTable variables = VariableTable::recover(f.function, frame);
+  const auto report = analyzeEmitRedundancy(f.function, frame, variables);
+  CHECK(report.redundantCasts == 1);
+  CHECK(report.format().find("1 redundant cast(s)") != std::string::npos);
+}
+
 TEST_CASE("a folded non-stack load counts towards the report (shape G)",
           "[analysis][emit-redundancy]") {
   Fixture f;

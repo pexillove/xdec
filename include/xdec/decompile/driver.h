@@ -65,7 +65,10 @@
 // not spinning.
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "xdec/analysis/path_explorer.h"
@@ -76,6 +79,10 @@
 #include "xdec/spec/engine.h"
 #include "xdec/support/reader.h"
 #include "xdec/support/result.h"
+
+namespace xdec::analysis {
+class ExecutionCoverage;
+}
 
 namespace xdec::decompile {
 
@@ -115,6 +122,10 @@ struct FunctionFence {
 struct DriverOptions {
   il::Maturity target = il::Maturity::Resolved;
   pass::Observer* observer = nullptr;  // final-round dumps, if wanted
+  /// Observer for the intermediate discovery pipelines (every settle's run to
+  /// Ssa). Null by default: they re-derive the same function many times over,
+  /// and a dump observer would write each copy.
+  pass::Observer* discoveryObserver = nullptr;
   /// Round budget (see the header).
   unsigned maxRounds = 8;
   /// Whether spending the last of the budget on a round that proved something
@@ -197,11 +208,39 @@ struct DriverOptions {
   /// the same "on and inexpensive when it finds nothing to do" posture the
   /// rest of this pipeline's optional facts take.
   analysis::PathExploreOptions pathExplore;
+  /// Dynamic function coverage loaded from a tracedb engine. When present,
+  /// lifting follows only instructions and successors observed in the selected
+  /// invocation(s); static discovery rounds are bypassed.
+  const analysis::ExecutionCoverage* executionCoverage = nullptr;
 };
+
+/// Why the discovery loop ended. Every value but the last two still produced a
+/// function from everything proved so far.
+enum class DriverStop : uint8_t {
+  /// A round found nothing new.
+  Converged,
+  /// The round budget (or its ceiling) ran out while rounds still proved edges.
+  RoundCap,
+  /// A resolved branch's target can never become a block (see driver.cpp).
+  StuckResolution,
+  /// The job asked to wind down (soft deadline, first Ctrl+C); see obs/job.h.
+  WindDown,
+  /// The target maturity needs no discovery loop (Ssa or below).
+  NoDiscovery,
+};
+
+[[nodiscard]] std::string_view toString(DriverStop stop) noexcept;
 
 /// What the loop did, for CLI reporting and tests.
 struct DriverReport {
+  DriverStop stop = DriverStop::Converged;
+  /// For WindDown: "deadline", "interrupt" or "cancel".
+  std::string windDownReason;
+  /// Discovery settles run across all rounds.
+  unsigned settles = 0;
   unsigned rounds = 0;
+  bool traceCovered = false;
+  std::size_t traceInstructionCount = 0;
   /// Entries beyond the function's own that rounds lifted from, in discovery
   /// order (each round's discoveries, accumulated).
   std::vector<uint64_t> extraEntries;
@@ -226,6 +265,10 @@ struct DriverResult {
 
 /// Lifts `entry` and drives it to `options.target`, discovering blocks across
 /// unresolved indirect branches as the rounds demand.
+///
+/// Honors the calling thread's obs::Job: a wind-down request ends discovery
+/// early (DriverStop::WindDown, output still produced), a stop request comes
+/// back as a Cancelled/Timeout diagnostic.
 [[nodiscard]] Result<DriverResult> decompile(const spec::SpecEngine& engine,
                                              const ByteReader& reader, uint64_t entry,
                                              pass::Registry& registry,

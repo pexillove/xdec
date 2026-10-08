@@ -20,6 +20,16 @@
 //     previous call's clobber — the ABI says a callee may leave x0..x7 holding
 //     anything, and SSA records that honestly. No caller deliberately passes a
 //     value it never wrote, so this slot is not an argument.
+//   - The register's own entry value, where no call on any path before this
+//     one could have destroyed it, sitting above the last slot this call
+//     writes itself: the caller is visibly building its own argument list and
+//     this register is not part of it — unless the body reads that register
+//     elsewhere, which makes it one of this function's parameters and a
+//     plausible one to forward. A call that writes no slot at all gets no such
+//     cut: from this side a pure forwarder (`(*env)->FindClass(env, name)`)
+//     looks exactly like it, and dropping a forwarded argument loses data the
+//     callee reads. After a clobbering call the same entry value had to be
+//     saved and restored deliberately, so there it always counts.
 //
 // The recovered arity is then the last set-up slot, and the operand list is
 // trimmed to it in the IL. Doing it here rather than at emission is what makes

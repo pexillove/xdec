@@ -55,6 +55,10 @@ class ExprPrinter {
   [[nodiscard]] std::string rootText(il::ExprId id);
   [[nodiscard]] std::string rootInteger(il::ExprId id);
 
+  /// A branch condition, optionally inverted. Inverting the comparison
+  /// operator itself avoids walls of `!((x != y))` in structured guards.
+  [[nodiscard]] std::string condition(il::ExprId id, bool invert);
+
   // -- subexpression sharing ------------------------------------------------
   //
   // The IL's expression pool is hash-consed (see il/expr.h), so a
@@ -139,14 +143,11 @@ class ExprPrinter {
   /// its own.
   [[nodiscard]] bool isRedundantRootZext(const il::Expr& expr) const;
 
-  /// `id`'s text for one side of an `==`/`!=` comparison, where
-  /// `comparedToZero` says the OTHER side is the literal 0. Zero-extension
-  /// never changes whether a value is zero, so `ZExt(x) == 0` reads exactly
-  /// as `x == 0` at `x`'s own width -- the one comparison outcome that does
-  /// not depend on the width `compare()`'s cast would otherwise assert.
-  /// Every other comparison (against a non-zero constant, or between two
-  /// live values) really does depend on it, so this only unwraps here.
-  [[nodiscard]] std::string equalityOperand(il::ExprId id, bool comparedToZero);
+  /// `id`'s text for one side of an `==`/`!=` comparison. A zero-extension
+  /// can be omitted when the other side is a constant representable at the
+  /// source width: widening changes neither side's value in that case.
+  [[nodiscard]] std::string equalityOperand(il::ExprId id,
+                                            std::optional<uint64_t> comparedConstant);
 
   /// Adds `root` and everything under it to `referenceCounts_`, without
   /// walking a node's operands more than once regardless of how many

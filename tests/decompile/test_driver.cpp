@@ -3,6 +3,7 @@
 // pipeline resolves it, the driver lifts what it points at — one round each.
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -11,6 +12,7 @@
 
 #include "xdec/decompile/driver.h"
 #include "xdec/il/function.h"
+#include "xdec/obs/job.h"
 #include "xdec/passes/builtin.h"
 #include "xdec/spec/compile.h"
 
@@ -282,6 +284,63 @@ TEST_CASE("a table slot pointing nowhere stays unresolved and fails honestly",
                                            options);
   REQUIRE(!result);
   CHECK(result.error().format().find("unresolved") != std::string::npos);
+}
+
+// A soft deadline is the caller saying "wrap up": the rounds already spent
+// are kept, discovery stops, and the result says why it is partial.
+TEST_CASE("a job past its soft deadline winds down to a partial result",
+          "[decompile][driver][obs]") {
+  const FlatMemory memory = program(0x1010);
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+
+  xdec::obs::Job job{"wind-down"};
+  job.setSoftDeadline(std::chrono::nanoseconds{1});
+  xdec::obs::JobScope scope{job};
+  xdec::decompile::DriverOptions options;
+  auto result = xdec::decompile::decompile(engine(), memory.reader(), 0x1000, registry,
+                                           options);
+  const std::string error = result ? std::string{} : result.error().format();
+  INFO(error);
+  REQUIRE(result);
+  CHECK(result->report.stop == xdec::decompile::DriverStop::WindDown);
+  CHECK(result->report.windDownReason == "deadline");
+  CHECK_FALSE(result->report.converged);
+  CHECK(result->report.rounds == 1);
+}
+
+// Cancellation is not an error in the input, so it surfaces as its own
+// diagnostic code rather than as an exception or a half-built function.
+TEST_CASE("a cancelled job stops the driver with a cancelled diagnostic",
+          "[decompile][driver][obs]") {
+  const FlatMemory memory = program(0x1010);
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+
+  xdec::obs::Job job{"cancel"};
+  job.requestCancel();
+  xdec::obs::JobScope scope{job};
+  xdec::decompile::DriverOptions options;
+  auto result = xdec::decompile::decompile(engine(), memory.reader(), 0x1000, registry,
+                                           options);
+  REQUIRE(!result);
+  CHECK(result.error().code() == xdec::DiagCode::Cancelled);
+}
+
+TEST_CASE("a job past its hard deadline stops the driver with a timeout",
+          "[decompile][driver][obs]") {
+  const FlatMemory memory = program(0x1010);
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+
+  xdec::obs::Job job{"timeout"};
+  job.setHardDeadline(std::chrono::nanoseconds{1});
+  xdec::obs::JobScope scope{job};
+  xdec::decompile::DriverOptions options;
+  auto result = xdec::decompile::decompile(engine(), memory.reader(), 0x1000, registry,
+                                           options);
+  REQUIRE(!result);
+  CHECK(result.error().code() == xdec::DiagCode::Timeout);
 }
 
 }  // namespace

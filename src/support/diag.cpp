@@ -36,6 +36,10 @@ std::string_view toString(DiagCode code) noexcept {
       return "analysis-limit";
     case DiagCode::PluginError:
       return "plugin-error";
+    case DiagCode::Cancelled:
+      return "cancelled";
+    case DiagCode::Timeout:
+      return "timeout";
   }
   return "unknown";
 }

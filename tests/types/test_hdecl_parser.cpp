@@ -54,6 +54,53 @@ TEST_CASE("typedefs, structs and enums import", "[types][parse]") {
   REQUIRE(path.names == std::vector<std::string>{"parent"});
 }
 
+// Wire formats are written without padding and have to be read that way. A
+// MIG message is the case that forced this: a 64-bit descriptor at a
+// four-byte offset, with every field after it named at the wrong address if
+// the attribute is dropped.
+TEST_CASE("packed aggregates lay out without padding", "[types][parse]") {
+  const TypeDatabase database = parseClean(R"(
+    typedef struct __attribute__((packed)) {
+      uint32_t count;
+      uint64_t address;
+      uint32_t size;
+    } Leading;
+    typedef struct {
+      uint32_t count;
+      uint64_t address;
+      uint32_t size;
+    } __attribute__((packed)) Trailing;
+    typedef struct {
+      uint32_t count;
+      uint64_t address;
+      uint32_t size;
+    } Padded;
+  )");
+
+  for (const char* name : {"Leading", "Trailing"}) {
+    INFO(name);
+    const TypeId id = database.lookup(name);
+    REQUIRE(id.valid());
+    REQUIRE(database.sizeOf(id) == 16);
+    REQUIRE(database.alignOf(id) == 1);
+    REQUIRE(database.fieldAt(id, 4).names == std::vector<std::string>{"address"});
+    REQUIRE(database.fieldAt(id, 12).names == std::vector<std::string>{"size"});
+  }
+
+  // And nothing changes for a struct that did not ask for it.
+  const TypeId padded = database.lookup("Padded");
+  REQUIRE(database.sizeOf(padded) == 24);
+  REQUIRE(database.fieldAt(padded, 8).names == std::vector<std::string>{"address"});
+
+  // The attribute has to survive into the C the preamble prints, or that C
+  // would describe a different object than the one the offsets came from.
+  const TypeId leading = database.lookup("Leading");
+  const std::vector<TypeId> roots{leading};
+  const std::string definitions = database.formatDefinitions(roots);
+  INFO(definitions);
+  REQUIRE(definitions.find("__attribute__((packed)) Leading") != std::string::npos);
+}
+
 TEST_CASE("declarator binding follows C, not left-to-right reading", "[types][parse]") {
   const TypeDatabase database = parseClean(R"(
     typedef int32_t *IntPtrArray[4];
@@ -203,4 +250,31 @@ TEST_CASE("the android-ndk preset imports cleanly", "[types][parse]") {
   REQUIRE(database.format(database.lookup("jobject")) == "jobject");
   REQUIRE(database.format(database.findDeclaration("pthread_once")->type) ==
           "int32_t (pthread_once_t* control, void (*init)(void))");
+}
+
+TEST_CASE("the ios-sdk public preset expands to ordered declaration layers",
+          "[types][parse]") {
+  const std::vector<std::string> layers = expandPresetBundle("ios-sdk");
+  REQUIRE(layers == std::vector<std::string>{
+                        "ios-sdk",
+                        "ios-sdk-libsystem",
+                        "ios-sdk-posix",
+                        "ios-sdk-cf-ext",
+                        "ios-sdk-mach-ipc",
+                    });
+
+  TypeDatabase database;
+  for (const std::string& layer : layers) {
+    const Result<std::string> path = resolveHeaderPath(layer);
+    REQUIRE(path.hasValue());
+    Result<ParseReport> report = parseHeaderFile(*path, database);
+    REQUIRE(report.hasValue());
+    INFO(report->format(layer));
+    REQUIRE(report->skipped == 0);
+  }
+
+  REQUIRE(database.findDeclaration("_open") != nullptr);
+  REQUIRE(database.findDeclaration("_CFURLCreateFromFileSystemRepresentation") != nullptr);
+  REQUIRE(database.findDeclaration("_NDR_record") != nullptr);
+  REQUIRE(database.lookup("mach_msg_rcv_buf_1ool_audit_t").valid());
 }

@@ -2,8 +2,13 @@
 
 The ordinary coverage command counts deliberate ``simd_fp_unmodelled`` and
 ``memory_unmodelled`` rules as decoded. This tool identifies their concrete
-opcodes in an ELF executable, disassembles them with Capstone, and ranks the
+opcodes in an executable, disassembles them with Capstone, and ranks the
 missing instruction families by static occurrence count.
+
+Reads ELF and 64-bit Mach-O. Only sections the linker marked as holding
+instructions are scanned, but a literal pool inside one is indistinguishable
+from code at this level, so a family Capstone names implausibly is usually
+constants rather than a real gap.
 """
 
 from __future__ import annotations
@@ -16,22 +21,57 @@ import subprocess
 from pathlib import Path
 
 import capstone
-from elftools.elf.constants import SH_FLAGS
-from elftools.elf.elffile import ELFFile
+
+MH_MAGIC_64 = 0xFEEDFACF
+LC_SEGMENT_64 = 0x19
+# S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+MACHO_INSTRUCTION_ATTRS = 0x80000000 | 0x00000400
 
 
-def executable_words(path: Path) -> dict[int, list[int]]:
-    locations: dict[int, list[int]] = collections.defaultdict(list)
+def _elf_sections(path: Path) -> list[tuple[int, bytes]]:
+    from elftools.elf.constants import SH_FLAGS
+    from elftools.elf.elffile import ELFFile
+
+    sections = []
     with path.open("rb") as stream:
         elf = ELFFile(stream)
         for section in elf.iter_sections():
-            if not (section["sh_flags"] & SH_FLAGS.SHF_EXECINSTR):
-                continue
-            data = section.data()
-            base = section["sh_addr"]
-            for offset in range(0, len(data) - 3, 4):
-                word = struct.unpack_from("<I", data, offset)[0]
-                locations[word].append(base + offset)
+            if section["sh_flags"] & SH_FLAGS.SHF_EXECINSTR:
+                sections.append((section["sh_addr"], section.data()))
+    return sections
+
+
+def _macho_sections(image: bytes) -> list[tuple[int, bytes]]:
+    ncmds = struct.unpack_from("<I", image, 16)[0]
+    sections = []
+    cursor = 32
+    for _ in range(ncmds):
+        command, size = struct.unpack_from("<II", image, cursor)
+        if command == LC_SEGMENT_64:
+            count = struct.unpack_from("<I", image, cursor + 64)[0]
+            entry = cursor + 72
+            for _ in range(count):
+                addr, length, offset = struct.unpack_from("<QQI", image, entry + 32)
+                flags = struct.unpack_from("<I", image, entry + 64)[0]
+                if flags & MACHO_INSTRUCTION_ATTRS:
+                    sections.append((addr, image[offset : offset + length]))
+                entry += 80
+        cursor += size
+    return sections
+
+
+def executable_words(path: Path) -> dict[int, list[int]]:
+    image = path.read_bytes()
+    if struct.unpack_from("<I", image, 0)[0] == MH_MAGIC_64:
+        sections = _macho_sections(image)
+    else:
+        sections = _elf_sections(path)
+
+    locations: dict[int, list[int]] = collections.defaultdict(list)
+    for base, data in sections:
+        for offset in range(0, len(data) - 3, 4):
+            word = struct.unpack_from("<I", data, offset)[0]
+            locations[word].append(base + offset)
     return locations
 
 

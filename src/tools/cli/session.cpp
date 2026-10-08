@@ -7,6 +7,8 @@
 
 #include "common.h"
 #include "xdec/analysis/plt_stub.h"
+#include "xdec/obs/job.h"
+#include "xdec/obs/span.h"
 #include "xdec/spec/compile.h"
 #include "xdec/spec/parse.h"
 #include "xdec/support/composite_reader.h"
@@ -15,6 +17,8 @@
 namespace xdec::cli {
 
 xdec::Result<std::unique_ptr<BinaryImage>> open(std::string_view path) {
+  xdec::obs::reportProgress("load", std::format("loading {}", path));
+  const xdec::obs::Span span{"load", "image", xdec::obs::kv("path", path)};
   return xdec::binary::openBinary(std::filesystem::path{path});
 }
 
@@ -27,6 +31,7 @@ std::filesystem::path specPath() {
 
 xdec::Result<std::unique_ptr<xdec::spec::SpecEngine>> loadEngine() {
   const std::filesystem::path path = specPath();
+  const xdec::obs::Span span{"load", "spec", xdec::obs::kv("path", path.string())};
   auto source = xdec::binary::FileBuffer::fromFile(path);
   if (!source) {
     return xdec::err(std::move(source).error());
@@ -48,11 +53,16 @@ xdec::Result<xdec::types::TypeDatabase> loadTypes(std::span<const std::string> s
                                                    bool verbose) {
   xdec::types::TypeDatabase database;
   for (const std::string& source : sources) {
-    XDEC_TRY(const std::string resolved, xdec::types::resolveHeaderPath(source));
-    XDEC_TRY(const xdec::types::ParseReport report,
-             xdec::types::parseHeaderFile(resolved, database));
-    if (verbose || report.skipped != 0) {
-      print("{}", report.format(source));
+    for (const std::string& layer : xdec::types::expandPresetBundle(source)) {
+      const xdec::obs::Span span{"load", "types", xdec::obs::kv("layer", layer)};
+      XDEC_TRY(const std::string resolved, xdec::types::resolveHeaderPath(layer));
+      XDEC_TRY(const xdec::types::ParseReport report,
+               xdec::types::parseHeaderFile(resolved, database));
+      if (verbose) {
+        print("{}", report.format(layer));
+      } else if (report.skipped != 0) {
+        note("{}", report.format(layer));
+      }
     }
   }
   return database;
@@ -186,16 +196,26 @@ xdec::Result<SessionContext> SessionContext::open(std::string_view path,
   ctx.profile = xdec::binary::inferTargetProfile(*ctx.image);
   ctx.buildEntryRegFacts(std::filesystem::path{path});
 
-  std::vector<std::string> typeSources = load.typeSources;
-  if (typeSources.empty()) {
-    typeSources = ctx.profile.typePresets;
+  // Platform declarations are the base; a project header is an overlay, not
+  // a replacement for libc/Mach/CoreFoundation. This also means spelling one
+  // `--types project.hdecl` no longer silently disables the automatically
+  // inferred SDK.
+  std::vector<std::string> typeSources = ctx.profile.typePresets;
+  for (const std::string& source : load.typeSources) {
+    if (std::find(typeSources.begin(), typeSources.end(), source) == typeSources.end()) {
+      typeSources.push_back(source);
+    }
   }
   ctx.hasTypes_ = !typeSources.empty();
   if (ctx.hasTypes_) {
     XDEC_TRY(xdec::types::TypeDatabase loaded, loadTypes(typeSources, /*verbose=*/false));
     ctx.types = std::move(loaded);
-    print("types: {} type(s), {} declaration(s) from {} header(s)", ctx.types.typeCount(),
-          ctx.types.declarations().size(), typeSources.size());
+    std::size_t headerCount = 0;
+    for (const std::string& source : typeSources) {
+      headerCount += xdec::types::expandPresetBundle(source).size();
+    }
+    note("types: {} type(s), {} declaration(s) from {} header(s)", ctx.types.typeCount(),
+          ctx.types.declarations().size(), headerCount);
   }
 
   std::string syscallSource = load.syscallSource;
@@ -218,7 +238,7 @@ xdec::Result<SessionContext> SessionContext::open(std::string_view path,
       if (syscallSource != xdec::types::SyscallTable::defaultName()) {
         return xdec::err(std::move(loaded).error());
       }
-      print("note: no syscall table ({}); svc will print as __xdec_syscall",
+      note("note: no syscall table ({}); svc will print as __xdec_syscall",
             loaded.error().format());
     } else {
       ctx.syscalls = std::move(*loaded);
@@ -271,16 +291,16 @@ void SessionContext::buildEntryRegFacts(const std::filesystem::path& binaryPath)
       }
     }
     if (companionPath.empty()) {
-      print("note: no companion image named '{}' found next to {}; entry register(s) "
-            "anchored to it stay unresolved",
-            name, binaryPath.string());
+      note("note: no companion image named '{}' found next to {}; entry register(s) "
+           "anchored to it stay unresolved",
+           name, binaryPath.string());
       continue;
     }
     auto companionImage = xdec::binary::openBinary(companionPath);
     if (!companionImage) {
-      print("note: companion image '{}' at {} did not open ({}); entry register(s) "
-            "anchored to it stay unresolved",
-            name, companionPath.string(), companionImage.error().format());
+      note("note: companion image '{}' at {} did not open ({}); entry register(s) "
+           "anchored to it stay unresolved",
+           name, companionPath.string(), companionImage.error().format());
       continue;
     }
     const uint64_t runtimeBase = (*companionImage)->memory().lowestAddress();

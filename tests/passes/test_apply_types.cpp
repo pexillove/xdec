@@ -74,11 +74,26 @@ class WordMemory {
 [[nodiscard]] constexpr uint32_t movz(unsigned rd, uint16_t imm16) {
   return 0xd2800000U | (static_cast<uint32_t>(imm16) << 5U) | rd;
 }
+/// `mov x<rd>, x<rm>`, encoded as `orr xd, xzr, xm`.
+[[nodiscard]] constexpr uint32_t movReg(unsigned rd, unsigned rm) {
+  return 0xaa0003e0U | (rm << 16U) | rd;
+}
 /// `ldr x<rt>, [x<rn>]`: reads the pointer a GOT slot holds.
 [[nodiscard]] constexpr uint32_t ldr(unsigned rt, unsigned rn) {
   return 0xf9400000U | (rn << 5U) | rt;
 }
 constexpr uint32_t kRet = 0xd65f03c0U;
+
+/// `movz` into every argument register from `first` up, starting at `va`, so
+/// the call that follows passes a set-up value in each (see passes/vars.h:
+/// an untouched entry value is not evidence of an argument). Returns the
+/// address after the last one.
+uint64_t setArguments(WordMemory& memory, uint64_t va, unsigned first = 0) {
+  for (unsigned reg = first; reg < 8; ++reg, va += 4) {
+    memory.put(va, movz(reg, static_cast<uint16_t>(reg + 1)));
+  }
+  return va;
+}
 
 /// The function at 0x1000 is `entry`; 0x2000 is `callee`. Anything else is
 /// nameless, which is what most of a stripped binary is.
@@ -152,13 +167,28 @@ constexpr uint32_t kRet = 0xd65f03c0U;
 }  // namespace
 
 // The baseline every other case is measured against: with nothing imported,
-// every argument register is a possible argument and the call keeps all eight.
+// every argument register the caller set up is a possible argument and the
+// call keeps all eight.
 TEST_CASE("without a header a call keeps the whole convention",
           "[passes][apply-types]") {
   WordMemory memory;
-  memory.put(0x1000, bl(0x1000));
-  memory.put(0x1004, kRet);
+  const uint64_t call = setArguments(memory, 0x1000);
+  memory.put(call, bl(0x2000 - static_cast<int64_t>(call)));
+  memory.put(call + 4, kRet);
   CHECK(argCount(memory, nullptr) == 8);
+}
+
+// After the first call x1 is dead, so the entry value arriving in it again was
+// parked in a callee-saved register and put back on purpose: a set-up argument
+// (see passes/vars.h), where the same value before any call would not be.
+TEST_CASE("an entry value restored after a call is an argument", "[passes][vars]") {
+  WordMemory memory;
+  memory.put(0x1000, movReg(19, 1));
+  memory.put(0x1004, bl(0x1000));
+  memory.put(0x1008, movReg(1, 19));
+  memory.put(0x100c, bl(0x2000 - 0x100c));
+  memory.put(0x1010, kRet);
+  CHECK(argCount(memory, nullptr) == 2);
 }
 
 TEST_CASE("a direct call is trimmed to the imported prototype's arity",
@@ -188,8 +218,9 @@ TEST_CASE("a call is never extended past what the convention attached",
 // `printf` really does read as many registers as its caller set.
 TEST_CASE("a variadic prototype trims nothing", "[passes][apply-types]") {
   WordMemory memory;
-  memory.put(0x1000, bl(0x1000));
-  memory.put(0x1004, kRet);
+  const uint64_t call = setArguments(memory, 0x1000);
+  memory.put(call, bl(0x2000 - static_cast<int64_t>(call)));
+  memory.put(call + 4, kRet);
 
   const TypeDatabase database = parse("int callee(const char *format, ...);");
   CHECK(argCount(memory, &database) == 8);
@@ -213,8 +244,9 @@ TEST_CASE("a call through a typed parameter is trimmed to the pointee's arity",
 // register with an unknown value, and nothing may be concluded from it.
 TEST_CASE("an untyped indirect call keeps every argument", "[passes][apply-types]") {
   WordMemory memory;
-  memory.put(0x1000, blr(0));
-  memory.put(0x1004, kRet);
+  const uint64_t call = setArguments(memory, 0x1000, 1);
+  memory.put(call, blr(0));
+  memory.put(call + 4, kRet);
 
   const TypeDatabase database = parse("int callee(void *dst, unsigned long n);");
   CHECK(argCount(memory, &database) == 8);
@@ -250,8 +282,9 @@ TEST_CASE("a GOT call keeps every argument without loader facts", "[passes][appl
   WordMemory memory;
   memory.put(0x1000, movz(8, 0x3000));
   memory.put(0x1004, ldr(8, 8));
-  memory.put(0x1008, blr(8));
-  memory.put(0x100c, kRet);
+  const uint64_t call = setArguments(memory, 0x1008);
+  memory.put(call, blr(8));
+  memory.put(call + 4, kRet);
 
   const TypeDatabase database = parse("int callee(void *dst, unsigned long n);");
   CHECK(argCount(memory, &database) == 8);

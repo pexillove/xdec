@@ -104,9 +104,10 @@ TEST_CASE("each arm of a conditional carries only its own edge's copies",
   REQUIRE(contains(text, "if ("));
   CHECK(count(text, "= 0x11;") == 1);
   CHECK(count(text, "= 0x22;") == 1);
-  CHECK(before(text, "if (", "= 0x11;"));
-  CHECK(before(text, "= 0x11;", "} else {"));
-  CHECK(before(text, "} else {", "= 0x22;"));
+  CHECK(contains(text, "if ((arg1 == 0x0)) {"));
+  CHECK(before(text, "if (", "= 0x22;"));
+  CHECK(before(text, "= 0x22;", "} else {"));
+  CHECK(before(text, "} else {", "= 0x11;"));
 }
 
 TEST_CASE("an unconditional branch carries its copies at the end of the block",

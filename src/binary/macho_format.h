@@ -135,10 +135,17 @@ inline constexpr uint64_t kChainedSegPageStart = 22;  // + 2 * page index
 inline constexpr uint16_t kChainedPtrStartNone = 0xFFFF;
 inline constexpr uint16_t kChainedPtrStartMulti = 0x8000;
 
-// dyld_chained_import (format 1: DYLD_CHAINED_IMPORT), one 32-bit word.
+// dyld chained-import table formats. Formats 1/2 share the same leading
+// 32-bit bitfield (lib_ordinal:8, weak_import:1, name_offset:23); format 2
+// appends a signed 32-bit addend. Format 3 widens the leading bitfield to
+// 64 bits (lib_ordinal:16, weak_import:1, reserved:15, name_offset:32) and
+// appends a signed 64-bit addend.
 inline constexpr uint32_t kChainedImportFormatNormal = 1;
+inline constexpr uint32_t kChainedImportFormatAddend = 2;
+inline constexpr uint32_t kChainedImportFormatAddend64 = 3;
 inline constexpr uint32_t kChainedImportNameOffsetShift = 9;
 inline constexpr uint32_t kChainedImportNameOffsetMask = 0x7fffffu;  // 23 bits
+inline constexpr uint32_t kChainedImport64NameOffsetShift = 32;
 
 // DYLD_CHAINED_PTR_* pointer formats. Only the two this loader has real
 // fixtures for (2, 6 -- see macho.cpp) are decoded; the rest are named in a

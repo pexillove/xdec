@@ -93,6 +93,11 @@ struct Fixture {
       }
       return out;
     };
+    options.names = [](uint64_t va) {
+      return va == 0x5000
+                 ? xdec::types::BoundName{"consume_size", true}
+                 : xdec::types::BoundName{};
+    };
     return printFunction(
         function, variables, frame,
         structureFunction(function, dominators, postDominators, loops), options);
@@ -124,6 +129,34 @@ constexpr std::string_view kNode = R"(
     struct Node *next;
   } Node;
   int32_t probe(const Node *n);
+)";
+
+constexpr std::string_view kPacket = R"(
+  typedef struct {
+    uint32_t tag;
+    uint8_t bytes[16];
+  } Packet;
+  uint8_t probe(const Packet *packet);
+)";
+
+/// Wire layout as a header actually describes it: the same bytes under two
+/// readings, with the byte view declared first so declaration order alone
+/// would pick the wrong one.
+constexpr std::string_view kOverlay = R"(
+  typedef struct {
+    uint64_t address;
+    uint32_t pad;
+    uint32_t size;
+  } Descriptor;
+  typedef union {
+    uint8_t bytes[16];
+    Descriptor ool;
+  } Body;
+  typedef struct {
+    uint64_t tag;
+    Body body;
+  } Overlay;
+  uint8_t probe(const Overlay *overlay);
 )";
 
 }  // namespace
@@ -208,9 +241,10 @@ TEST_CASE("a field read at another width is not named", "[emit][types]") {
   CHECK(!contains(text, "n->value"));
 }
 
-// Arithmetic on a declared pointer has to cast back: `n + 4` on a `Node*` steps
-// four elements, and the body means four bytes.
-TEST_CASE("arithmetic on an imported pointer casts back to an integer",
+// A byte displacement from a declared pointer must not use C's scaled
+// `Node* + n` arithmetic. The address renderer keeps it pointer-shaped while
+// making the byte unit explicit.
+TEST_CASE("an unmatched imported-pointer offset uses byte pointer arithmetic",
           "[emit][types]") {
   Fixture f;
   f.consume(f.load(f.plus(f.entryReg("x0"), 24), 32));
@@ -218,5 +252,141 @@ TEST_CASE("arithmetic on an imported pointer casts back to an integer",
   const TypeDatabase database = parse(kNode);
   const std::string text = f.emit(&database);
   INFO(text);
-  CHECK(contains(text, "(uint64_t)(n) + 0x18"));
+  CHECK(contains(text, "(uint8_t*)(n) + 0x18"));
+  CHECK(!contains(text, "(uint64_t)(n)"));
+}
+
+TEST_CASE("an access inside an array field prints an element path",
+          "[emit][types]") {
+  Fixture f;
+  f.consume(f.load(f.plus(f.entryReg("x0"), 4 + 11), 8));
+
+  const TypeDatabase database = parse(kPacket);
+  const std::string text = f.emit(&database);
+  INFO(text);
+  CHECK(contains(text, "packet->bytes[0xb]"));
+}
+
+// A byte buffer names no element a wide read could be, but it does name the
+// buffer, and that is the honest thing to anchor the reinterpretation to --
+// `bytes[4]` says which byte of what, where an offset from the object's head
+// leaves the reader subtracting the header's size by hand.
+TEST_CASE("a wide access inside a byte buffer prints a view of the buffer",
+          "[emit][types]") {
+  Fixture f;
+  f.consume(f.load(f.plus(f.entryReg("x0"), 4 + 4), 32));
+
+  const TypeDatabase database = parse(kPacket);
+  const std::string text = f.emit(&database);
+  INFO(text);
+  CHECK(contains(text, "(*(uint32_t*)&packet->bytes[0x4])"));
+  CHECK(!contains(text, "(uint8_t*)(packet)"));
+}
+
+// Past the declared end the header and the code disagree about the object,
+// and that disagreement is the one thing a field spelling must not hide.
+TEST_CASE("a byte-buffer view that straddles the declared end stays explicit",
+          "[emit][types]") {
+  Fixture f;
+  f.consume(f.load(f.plus(f.entryReg("x0"), 4 + 14), 32));
+
+  const TypeDatabase database = parse(kPacket);
+  const std::string text = f.emit(&database);
+  INFO(text);
+  CHECK(!contains(text, "packet->bytes[14]"));
+  CHECK(contains(text, "(uint8_t*)(packet) + 0x12"));
+}
+
+// Every arm of a union starts at the same byte, so the offset alone cannot
+// choose between them and declaration order is not a reason. The width of the
+// access is: an eight-byte read means the arm with an eight-byte leaf there.
+TEST_CASE("a union arm is chosen by the width of the access", "[emit][types]") {
+  Fixture f;
+  f.consume(f.load(f.plus(f.entryReg("x0"), 8), 64));
+
+  const TypeDatabase database = parse(kOverlay);
+  const std::string text = f.emit(&database);
+  INFO(text);
+  CHECK(contains(text, "overlay->body.ool.address"));
+}
+
+TEST_CASE("a narrower access picks the arm whose leaf is that wide",
+          "[emit][types]") {
+  Fixture f;
+  f.consume(f.load(f.plus(f.entryReg("x0"), 8 + 12), 32));
+
+  const TypeDatabase database = parse(kOverlay);
+  const std::string text = f.emit(&database);
+  INFO(text);
+  CHECK(contains(text, "overlay->body.ool.size"));
+}
+
+// And with no arm of that width, the byte arm still names where the read
+// happened rather than falling back to an offset from the object's head.
+TEST_CASE("a width no union arm matches still anchors to the byte arm",
+          "[emit][types]") {
+  Fixture f;
+  f.consume(f.load(f.plus(f.entryReg("x0"), 8 + 2), 16));
+
+  const TypeDatabase database = parse(kOverlay);
+  const std::string text = f.emit(&database);
+  INFO(text);
+  CHECK(contains(text, "(*(uint16_t*)&overlay->body.bytes[0x2])"));
+}
+
+TEST_CASE("a MIG-shaped handler combines fields addresses and typed widening",
+          "[emit][types][mig]") {
+  Fixture f;
+  const ExprId request = f.entryReg("x0");
+  const ExprId reply = f.entryReg("x1");
+  const ExprId descriptorByte = f.load(f.plus(request, 7), 8);
+  f.function.appendStore(f.entry, f.va_, Type::integer(8),
+                         f.function.constant(Type::integer(64), 0x41000),
+                         descriptorByte);
+  f.va_ += 4;
+  const ExprId count = f.load(f.plus(request, 20), 32);
+  f.function.appendStore(f.entry, f.va_, Type::integer(32),
+                         f.plus(reply, 4),
+                         f.function.constant(Type::integer(32), 0x38));
+  f.va_ += 4;
+  const ExprId sharedReplyAddress = f.plus(reply, 8);
+  f.function.appendStore(f.entry, f.va_, Type::integer(32),
+                         sharedReplyAddress,
+                         f.function.constant(Type::integer(32), 1));
+  f.va_ += 4;
+  const il::OpId call =
+      f.function.appendCall(f.entry, f.va_,
+                            f.function.constant(Type::integer(64), 0x5000));
+  f.va_ += 4;
+  f.function.setOperands(
+      call, std::vector<ExprId>{
+                f.function.constant(Type::integer(64), 0x5000),
+                f.function.cast(il::ExprOp::ZExt, Type::integer(64), count)});
+  f.function.appendStore(f.entry, f.va_, Type::integer(32),
+                         sharedReplyAddress,
+                         f.function.constant(Type::integer(32), 0));
+  f.va_ += 4;
+  f.function.appendReturn(f.entry, f.va_);
+
+  const TypeDatabase database = parse(R"(
+    typedef struct {
+      uint32_t bits;
+      uint8_t descriptor[16];
+      uint32_t count;
+    } MigRequest;
+    typedef struct {
+      uint32_t bits;
+      uint32_t size;
+      uint8_t payload[8];
+    } MigReply;
+    void consume_size(uint64_t size);
+    void probe(MigRequest *request, MigReply *reply);
+  )");
+  const std::string text = f.emit(&database);
+  INFO(text);
+  CHECK(contains(text, "request->descriptor[0x3]"));
+  CHECK(contains(text, "reply->size = 0x38;"));
+  CHECK(contains(text, "consume_size("));
+  CHECK(!contains(text, "consume_size(((uint64_t)"));
+  CHECK(!contains(text, "(uint64_t)(reply)"));
 }

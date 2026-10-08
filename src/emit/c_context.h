@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "xdec/analysis/address_expr.h"
 #include "xdec/analysis/image_literals.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/string_store_fold.h"
@@ -95,6 +96,12 @@ struct StringStoreText {
   std::string text;
 };
 
+struct CseTemp {
+  std::string name;
+  uint32_t width = 0;
+  bool pointer = false;
+};
+
 class CContext {
  public:
   CContext(const il::Function& theFunction,
@@ -113,6 +120,10 @@ class CContext {
   /// answers nothing everywhere -- the same "no evidence" shape `addresses`
   /// and `symbols` already default to.
   analysis::ImageLiteralRecovery literals;
+  /// Scalar IL expressions that are proven byte displacements from pointer
+  /// bases. Shared by field naming, address rendering and expression CSE so
+  /// those consumers do not independently guess pointer provenance.
+  analysis::AddressExprAnalysis addressExpressions;
 
   /// Value index -> temporary name, for results that must not be re-evaluated
   /// at each use: loads, calls, intrinsics, and untracked register reads.
@@ -155,7 +166,7 @@ class CContext {
   /// times in one printed scope (see ExprPrinter::beginScope). Declared like
   /// any other temp; c_stmt.cpp prints the assignment that fills each one
   /// as an ordinary statement right before the code that first needs it.
-  std::vector<std::pair<std::string, uint32_t>> cseTemps;
+  std::vector<CseTemp> cseTemps;
   /// Ops the body will never print -- today, exactly `deadJumpTableLoad`'s
   /// finds (see c_stmt.h). Computed once, in the constructor, from the
   /// already-built structured tree: before `Assembler::nameResultTemps`
@@ -258,8 +269,26 @@ class CContext {
   /// something this struct does not describe -- a different version of it, or
   /// not this struct at all -- and printing the nearest field name would turn
   /// that discrepancy into a plausible-looking lie.
+  ///
+  /// The one weaker spelling allowed is a byte buffer's: a header that models
+  /// wire layout as `uint8_t payload[32]` has described the bytes truthfully
+  /// and named nothing at all inside them, so a four-byte read there is not a
+  /// discrepancy to hide behind a wrong field name -- it is a reinterpretation
+  /// the listing should say out loud, anchored to the buffer it happens in.
+  /// See `byteBufferView`.
   [[nodiscard]] std::string fieldAccess(il::ExprId address, uint32_t width,
                                         il::ValueId result);
+
+  /// `(*(uint32_t*)&reply->payload[16])`: a `width`-bit access `byteOffset`
+  /// bytes into a declared array of bytes. Empty unless the array really is
+  /// one of bytes, the access is wider than a byte, and the whole of it fits
+  /// inside the declared length -- an out-of-bounds or straddling read would
+  /// be exactly the disagreement between header and code that `fieldAccess`
+  /// refuses to paper over.
+  [[nodiscard]] std::string byteBufferView(const std::string& baseName,
+                                           const std::string& path,
+                                           const types::TypeEntry& array, uint64_t byteOffset,
+                                           uint32_t width, types::TypeId baseType);
 
   /// The imported type a value turned out to hold, when reading it through a
   /// declared struct said so: `t2 = node->left` makes `t2` an `EvalNode*`, and

@@ -209,6 +209,27 @@ Result<void> TypeDatabase::defineAggregate(TypeId id, std::vector<StructField> f
   return ok();
 }
 
+Result<void> TypeDatabase::setPacked(TypeId id) {
+  TypeEntry* entry = entries_.tryGet(id);
+  if (entry == nullptr ||
+      (entry->kind != TypeKind::Struct && entry->kind != TypeKind::Union)) {
+    return err(DiagCode::Internal, "setPacked on a non-aggregate type");
+  }
+  if (entry->packed) {
+    return ok();
+  }
+  entry->packed = true;
+  if (entry->complete) {
+    // The offsets already assigned were the unpacked ones, so they have to be
+    // recomputed rather than kept: that is the whole point of the attribute.
+    for (StructField& field : entry->fields) {
+      field.offset = 0;
+    }
+    computeLayout(*entry, /*explicitOffsets=*/false);
+  }
+  return ok();
+}
+
 Result<void> TypeDatabase::defineEnum(TypeId id, std::vector<EnumConstant> constants,
                                       TypeId base) {
   {
@@ -352,7 +373,7 @@ void TypeDatabase::computeLayout(TypeEntry& entry, bool explicitOffsets) const {
   uint64_t offset = 0;
   uint32_t maxAlign = 1;
   for (StructField& field : entry.fields) {
-    const uint32_t fieldAlign = alignOf(field.type).value_or(1);
+    const uint32_t fieldAlign = entry.packed ? 1 : alignOf(field.type).value_or(1);
     maxAlign = std::max(maxAlign, fieldAlign);
     if (field.flexible) {
       // A flexible array member sits at the end and adds nothing to the size.
@@ -375,43 +396,93 @@ void TypeDatabase::computeLayout(TypeEntry& entry, bool explicitOffsets) const {
   entry.size = roundUp(offset, maxAlign);
 }
 
-TypeDatabase::FieldPath TypeDatabase::fieldAt(TypeId aggregate, uint64_t offset) const {
-  FieldPath path;
-  TypeId current = resolveTypedef(aggregate);
-  uint64_t remaining = offset;
-  for (unsigned depth = 0; depth < 16; ++depth) {
-    const TypeEntry* entry = get(current);
-    if (entry == nullptr || !entry->complete ||
-        (entry->kind != TypeKind::Struct && entry->kind != TypeKind::Union)) {
-      break;
-    }
-    const StructField* best = nullptr;
-    for (const StructField& field : entry->fields) {
-      if (field.offset > remaining) {
-        continue;
-      }
-      const uint64_t extent = field.flexible ? ~uint64_t{0}
-                                             : field.offset + sizeOf(field.type).value_or(0);
-      if (remaining < extent && (best == nullptr || field.offset >= best->offset)) {
-        best = &field;
-      }
-    }
-    if (best == nullptr) {
-      break;
-    }
-    path.names.push_back(best->name);
-    path.type = best->type;
-    remaining -= best->offset;
-    const TypeId next = resolveTypedef(best->type);
-    const TypeEntry* nextEntry = get(next);
-    if (nextEntry == nullptr ||
-        (nextEntry->kind != TypeKind::Struct && nextEntry->kind != TypeKind::Union)) {
-      break;
-    }
-    current = next;
+TypeDatabase::FieldPath TypeDatabase::fieldAt(TypeId aggregate, uint64_t offset,
+                                              uint32_t accessBits) const {
+  return fieldSearch(resolveTypedef(aggregate), offset, accessBits, 0);
+}
+
+TypeDatabase::FieldPath TypeDatabase::fieldSearch(TypeId aggregate, uint64_t offset,
+                                                  uint32_t accessBits, unsigned depth) const {
+  FieldPath best;
+  if (depth >= 16) {
+    return best;
   }
-  path.remainder = remaining;
-  return path;
+  const TypeEntry* entry = get(aggregate);
+  if (entry == nullptr || !entry->complete ||
+      (entry->kind != TypeKind::Struct && entry->kind != TypeKind::Union)) {
+    return best;
+  }
+
+  // How well a path answers an access `accessBits` wide. The best answer is a
+  // leaf of exactly that width with nothing left over; the worst is a path
+  // that ends part-way into a scalar, which names nothing that is being read.
+  // Between them sits an array element boundary: no element is the access, but
+  // the buffer and the byte within it are still a place a reader can follow.
+  // Without a width to ask about (`accessBits == 0`) no caller has an access
+  // behind it, so every candidate ranks the same and offset alone decides.
+  const auto rank = [&](const FieldPath& path) -> int {
+    if (accessBits == 0 || !path.found()) {
+      return 0;
+    }
+    const TypeEntry* leaf = get(resolveTypedef(path.type));
+    if (leaf != nullptr && leaf->kind == TypeKind::Array) {
+      const uint64_t element = sizeOf(leaf->element).value_or(0);
+      if (element == 0 || path.remainder % element != 0) {
+        return 0;
+      }
+      return element * 8 == accessBits ? 3 : 2;
+    }
+    if (path.remainder != 0) {
+      return 0;
+    }
+    return sizeOf(path.type).value_or(0) * 8 == accessBits ? 3 : 1;
+  };
+
+  int bestRank = 0;
+  uint64_t bestOffset = 0;
+  for (const StructField& field : entry->fields) {
+    if (field.offset > offset) {
+      continue;
+    }
+    const uint64_t extent =
+        field.flexible ? ~uint64_t{0} : field.offset + sizeOf(field.type).value_or(0);
+    if (offset >= extent) {
+      continue;
+    }
+
+    FieldPath candidate;
+    candidate.names.push_back(field.name);
+    candidate.type = field.type;
+    candidate.remainder = offset - field.offset;
+    const TypeId next = resolveTypedef(field.type);
+    const TypeEntry* nextEntry = get(next);
+    if (nextEntry != nullptr &&
+        (nextEntry->kind == TypeKind::Struct || nextEntry->kind == TypeKind::Union)) {
+      const FieldPath nested = fieldSearch(next, candidate.remainder, accessBits, depth + 1);
+      if (nested.found()) {
+        FieldPath descended = candidate;
+        descended.names.insert(descended.names.end(), nested.names.begin(), nested.names.end());
+        descended.type = nested.type;
+        descended.remainder = nested.remainder;
+        // Going deeper is not always going better. An eight-byte read of an
+        // eight-byte struct is that struct, not its first byte, so the deeper
+        // path is taken only when it answers the access at least as well.
+        if (rank(descended) >= rank(candidate)) {
+          candidate = std::move(descended);
+        }
+      }
+    }
+
+    const int candidateRank = rank(candidate);
+    const bool better = !best.found() || candidateRank > bestRank ||
+                        (candidateRank == bestRank && field.offset >= bestOffset);
+    if (better) {
+      best = std::move(candidate);
+      bestRank = candidateRank;
+      bestOffset = field.offset;
+    }
+  }
+  return best;
 }
 
 Result<void> TypeDatabase::declareFunction(std::string_view name, TypeId functionTypeId) {
@@ -673,7 +744,11 @@ std::string TypeDatabase::formatDefinitions(std::span<const TypeId> roots) const
                            field.offset);
       }
     }
-    out += viaTypedef ? std::format("}} {};\n", entry.name) : "};\n";
+    // The attribute travels with the definition or the C printed here would
+    // lay the fields out differently than the addresses it names them at.
+    const std::string_view attribute = entry.packed ? " __attribute__((packed))" : "";
+    out += viaTypedef ? std::format("}}{} {};\n", attribute, entry.name)
+                      : std::format("}}{};\n", attribute);
   }
   return out;
 }

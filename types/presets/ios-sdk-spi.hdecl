@@ -1,0 +1,10 @@
+// Private iOS interfaces. Kept separate from public SDK declarations and
+// loaded only when the Mach-O import table proves the image uses them.
+
+CFTypeRef _MGCopyAnswer(CFStringRef question);
+uint32_t _notify_post(const char *name);
+
+// libsystem_containermanager SPI. The first argument is an opaque identifier;
+// the returned string is heap-owned, and `success` receives status.
+char *_container_system_path_for_identifier(void *identifier,
+                                             intptr_t *success);

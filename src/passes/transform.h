@@ -3,11 +3,26 @@
 // deobfuscation passes reuse them.
 #pragma once
 
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 
 #include "xdec/il/function.h"
+#include "xdec/obs/job.h"
+#include "xdec/obs/span.h"
 
 namespace xdec::passes {
+
+/// Runs one sub-phase of a pass under its own span, after a cancellation
+/// checkpoint: a fixpoint pass's total says nothing about which of its phases
+/// is slow, and a hard deadline should not have to wait out a whole iteration.
+template <class Fn>
+auto subPhase(std::string_view name, Fn&& fn) {
+  obs::checkpoint(name);
+  const obs::Span span{"subpass", std::string{name}};
+  return std::forward<Fn>(fn)();
+}
 
 /// Above this many ops, a block is a "mega-block": straight-line code (an
 /// unrolled hash round, say) with no internal branch, dense enough that

@@ -879,6 +879,12 @@ class Checker {
   }
 
   /// The values an integer expression can take, when that is known.
+  ///
+  /// Arithmetic is followed through, because a lane index or a shift amount is
+  /// almost never a bare field: it is assembled from two or three of them.
+  /// Without this, every such argument would have to give up its declared
+  /// bound, and a declared bound the checker cannot verify is worse than none
+  /// at all.
   bool rangeOf(const Expr& expr, Env& env, uint64_t& low, uint64_t& high) {
     if (expr.kind == ExprKind::Integer) {
       low = expr.integer;
@@ -899,7 +905,119 @@ class Checker {
       high = constant;
       return true;
     }
-    return false;
+    if (expr.kind == ExprKind::Conditional) {
+      // The condition is compile-time, but it need not be decided yet. Either
+      // arm is reachable, so the bound has to cover both.
+      uint64_t thenLow = 0;
+      uint64_t thenHigh = 0;
+      uint64_t elseLow = 0;
+      uint64_t elseHigh = 0;
+      if (rangeOf(*expr.args[1], env, thenLow, thenHigh) &&
+          rangeOf(*expr.args[2], env, elseLow, elseHigh)) {
+        low = std::min(thenLow, elseLow);
+        high = std::max(thenHigh, elseHigh);
+        return true;
+      }
+      return false;
+    }
+    if (expr.kind != ExprKind::Binary) return false;
+    uint64_t leftLow = 0;
+    uint64_t leftHigh = 0;
+    uint64_t rightLow = 0;
+    uint64_t rightHigh = 0;
+    if (!rangeOf(*expr.args[0], env, leftLow, leftHigh) ||
+        !rangeOf(*expr.args[1], env, rightLow, rightHigh)) {
+      return false;
+    }
+    return binaryRange(expr.binaryOp, leftLow, leftHigh, rightLow, rightHigh,
+                       low, high);
+  }
+
+  /// Every case here must refuse rather than wrap: a bound derived from an
+  /// overflowed product would be a false proof, which is the one outcome worse
+  /// than reporting that nothing could be proved.
+  static bool binaryRange(BinaryOp op, uint64_t leftLow, uint64_t leftHigh,
+                          uint64_t rightLow, uint64_t rightHigh, uint64_t& low,
+                          uint64_t& high) {
+    switch (op) {
+      case BinaryOp::Add:
+        if (leftHigh > UINT64_MAX - rightHigh) return false;
+        low = leftLow + rightLow;
+        high = leftHigh + rightHigh;
+        return true;
+      case BinaryOp::Sub:
+        // Only provable when the result cannot go negative, since these are
+        // unsigned quantities and a wrapped bound would be nonsense.
+        if (leftLow < rightHigh) return false;
+        low = leftLow - rightHigh;
+        high = leftHigh - rightLow;
+        return true;
+      case BinaryOp::Mul:
+        if (rightHigh != 0 && leftHigh > UINT64_MAX / rightHigh) return false;
+        low = leftLow * rightLow;
+        high = leftHigh * rightHigh;
+        return true;
+      case BinaryOp::Shl:
+        if (rightHigh >= 64) return false;
+        if (leftHigh > (UINT64_MAX >> rightHigh)) return false;
+        low = leftLow << rightLow;
+        high = leftHigh << rightHigh;
+        return true;
+      case BinaryOp::ShrU:
+        low = leftLow >> std::min<uint64_t>(rightHigh, 63);
+        high = leftHigh >> std::min<uint64_t>(rightLow, 63);
+        return true;
+      case BinaryOp::DivU:
+        if (rightLow == 0) return false;
+        low = leftLow / rightHigh;
+        high = leftHigh / rightLow;
+        return true;
+      case BinaryOp::RemU:
+        if (rightLow == 0) return false;
+        low = 0;
+        high = rightHigh - 1;
+        return true;
+      case BinaryOp::And:
+        // A bitwise AND cannot exceed either operand, whatever the bits are.
+        low = 0;
+        high = std::min(leftHigh, rightHigh);
+        return true;
+      case BinaryOp::Or:
+      case BinaryOp::Xor: {
+        // Bounded by the next power of two above the larger operand, which is
+        // exact when the operands occupy disjoint bit positions and safe when
+        // they do not.
+        const uint64_t larger = std::max(leftHigh, rightHigh);
+        if (larger == UINT64_MAX) return false;
+        uint64_t saturated = larger;
+        saturated |= saturated >> 1;
+        saturated |= saturated >> 2;
+        saturated |= saturated >> 4;
+        saturated |= saturated >> 8;
+        saturated |= saturated >> 16;
+        saturated |= saturated >> 32;
+        low = 0;
+        high = saturated;
+        return true;
+      }
+      case BinaryOp::Equal:
+      case BinaryOp::NotEqual:
+      case BinaryOp::LessU:
+      case BinaryOp::LessEqualU:
+      case BinaryOp::LessS:
+      case BinaryOp::LessEqualS:
+      case BinaryOp::GreaterU:
+      case BinaryOp::GreaterEqualU:
+      case BinaryOp::GreaterS:
+      case BinaryOp::GreaterEqualS:
+      case BinaryOp::LogicalAnd:
+      case BinaryOp::LogicalOr:
+        low = 0;
+        high = 1;
+        return true;
+      default:
+        return false;
+    }
   }
 
   // -- types ----------------------------------------------------------------

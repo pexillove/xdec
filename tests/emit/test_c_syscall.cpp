@@ -139,7 +139,7 @@ TEST_CASE("a number the table does not list keeps the number and the arguments",
             {f.entryReg("x0"), f.entryReg("x1")});
   const std::string text = f.emit(&table());
   INFO(text);
-  CHECK(contains(text, "__xdec_syscall(9999,"));
+  CHECK(contains(text, "__xdec_syscall(0x270f,"));
   CHECK(contains(text, "long __xdec_syscall(long nr, ...);"));
 }
 
@@ -163,6 +163,6 @@ TEST_CASE("without a table a syscall still prints as a syscall", "[emit][syscall
   f.syscall(f.function.constant(Type::integer(64), 64), {f.entryReg("x0")});
   const std::string text = f.emit(nullptr);
   INFO(text);
-  CHECK(contains(text, "__xdec_syscall(64,"));
+  CHECK(contains(text, "__xdec_syscall(0x40,"));
   CHECK(!contains(text, "__xdec_intrin_aarch64.svc"));
 }

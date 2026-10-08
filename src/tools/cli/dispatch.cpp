@@ -52,7 +52,7 @@ int dispatch(std::span<const std::string_view> args) {
     return commandTypes(std::span<const std::string_view>{args}.subspan(1));
   }
   if (!requireArgs(1)) {
-    print("error: '{}' needs a binary path", command);
+    printError("'{}' needs a binary path", command);
     return usage();
   }
 
@@ -68,19 +68,19 @@ int dispatch(std::span<const std::string_view> args) {
   if (command == "images") {
     uint64_t limit = 200;
     if (args.size() > 2 && !parseNumber(args[2], limit)) {
-      print("error: '{}' is not a number", args[2]);
+      printError("'{}' is not a number", args[2]);
       return 1;
     }
     return commandImages(args[1], limit);
   }
   if (command == "cache-locate") {
     if (!requireArgs(2)) {
-      printLine("error: cache-locate needs a cache path and an address");
+      printError("cache-locate needs a cache path and an address");
       return usage();
     }
     uint64_t address = 0;
     if (!parseNumber(args[2], address)) {
-      print("error: '{}' is not a number", args[2]);
+      printError("'{}' is not a number", args[2]);
       return 1;
     }
     return commandCacheLocate(args[1], address);
@@ -88,7 +88,7 @@ int dispatch(std::span<const std::string_view> args) {
   if (command == "coverage") {
     uint64_t limit = 20;
     if (args.size() > 2 && !parseNumber(args[2], limit)) {
-      print("error: '{0}' is not a number", args[2]);
+      printError("'{0}' is not a number", args[2]);
       return 1;
     }
     return commandCoverage(args[1], limit);
@@ -96,33 +96,33 @@ int dispatch(std::span<const std::string_view> args) {
   if (command == "symbols" || command == "relocs") {
     uint64_t limit = 40;
     if (args.size() > 2 && !parseNumber(args[2], limit)) {
-      print("error: '{}' is not a number", args[2]);
+      printError("'{}' is not a number", args[2]);
       return 1;
     }
     return command == "symbols" ? commandSymbols(args[1], limit) : commandRelocs(args[1], limit);
   }
   if (command == "exec") {
     if (!requireArgs(2)) {
-      printLine("error: exec needs a binary and a workload file");
+      printError("exec needs a binary and a workload file");
       return usage();
     }
     return commandExec(args[1], args[2]);
   }
   if (command == "memdump") {
     if (!requireArgs(2)) {
-      printLine("error: memdump needs a binary and an output path");
+      printError("memdump needs a binary and an output path");
       return usage();
     }
     return commandMemDump(args[1], args[2]);
   }
   if (command == "observe") {
     if (!requireArgs(2)) {
-      printLine("error: observe needs a binary and a function address");
+      printError("observe needs a binary and a function address");
       return usage();
     }
     uint64_t address = 0;
     if (!parseNumber(args[2], address)) {
-      print("error: '{}' is not a number", args[2]);
+      printError("'{}' is not a number", args[2]);
       return 1;
     }
     return commandObserve(args[1], address,
@@ -130,12 +130,12 @@ int dispatch(std::span<const std::string_view> args) {
   }
   if (command == "decompile") {
     if (!requireArgs(2)) {
-      printLine("error: decompile needs a binary and a function address");
+      printError("decompile needs a binary and a function address");
       return usage();
     }
     uint64_t address = 0;
     if (!parseNumber(args[2], address)) {
-      print("error: '{}' is not a number", args[2]);
+      printError("'{}' is not a number", args[2]);
       return 1;
     }
     return commandDecompile(args[1], address,
@@ -143,13 +143,13 @@ int dispatch(std::span<const std::string_view> args) {
   }
   if (command == "read" || command == "disasm" || command == "lift") {
     if (!requireArgs(3)) {
-      print("error: {} needs an address and a count", command);
+      printError("{} needs an address and a count", command);
       return usage();
     }
     uint64_t address = 0;
     uint64_t size = 0;
     if (!parseNumber(args[2], address) || !parseNumber(args[3], size)) {
-      printLine("error: address and size must be numbers");
+      printError("address and size must be numbers");
       return 1;
     }
     if (command == "read") {
@@ -159,7 +159,7 @@ int dispatch(std::span<const std::string_view> args) {
                                 : commandLift(args[1], address, size);
   }
 
-  print("error: unknown command '{}'", command);
+  printError("unknown command '{}'", command);
   return usage();
 }
 

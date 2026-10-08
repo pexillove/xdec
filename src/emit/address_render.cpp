@@ -16,6 +16,10 @@ std::optional<AddressRenderResult> AddressRenderer::render(il::ExprId expr, Addr
     case analysis::AddressKind::Global:
       return renderGlobal(info.address, role, width);
     case analysis::AddressKind::Other:
+      if (const std::optional<analysis::AddressExpr> address =
+              ctx_.addressExpressions.classify(expr)) {
+        return renderPointerOffset(*address, role, width);
+      }
       return std::nullopt;
   }
   return std::nullopt;
@@ -59,7 +63,7 @@ std::optional<AddressRenderResult> AddressRenderer::renderGlobal(uint64_t va, Ad
     const types::TypeBinder* binder = ctx_.binder();
     const bool headerTyped = binder != nullptr && binder->at(va).valid();
     if (width == 8 && !headerTyped) {
-      return AddressRenderResult{std::format("{}[0]", *name), false};
+      return AddressRenderResult{std::format("{}[0x0]", *name), false};
     }
     return AddressRenderResult{std::format("(*({}*)({}))", intType(width), *name), false};
   }
@@ -68,6 +72,57 @@ std::optional<AddressRenderResult> AddressRenderer::renderGlobal(uint64_t va, Ad
   // bare, the same as a header-bound global's own declared type is not this
   // renderer's business to second-guess with a cast.
   return AddressRenderResult{*name, true};
+}
+
+std::optional<AddressRenderResult> AddressRenderer::renderPointerOffset(
+    const analysis::AddressExpr& address, AddressRole role,
+    uint32_t width) const {
+  if (address.kind != analysis::AddressBaseKind::Argument &&
+      address.kind != analysis::AddressBaseKind::Value) {
+    return std::nullopt;
+  }
+
+  const il::Expr& baseExpression = ctx_.function.expr(address.base);
+  std::string base;
+  if (baseExpression.op == il::ExprOp::EntryReg) {
+    const analysis::Variable* argument = ctx_.variables.argumentFor(
+        il::RegId{static_cast<uint32_t>(baseExpression.immediate)});
+    if (argument == nullptr) {
+      return std::nullopt;
+    }
+    base = ctx_.argumentName(*argument);
+  } else if (baseExpression.op == il::ExprOp::Value) {
+    const il::ValueId value{static_cast<uint32_t>(baseExpression.immediate)};
+    if (const std::string* temporary = ctx_.tempFor(value)) {
+      base = *temporary;
+    } else if (const analysis::Variable* variable =
+                   ctx_.variables.tempFor(value)) {
+      base = variable->name;
+    } else {
+      return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+
+  std::string pointer = base;
+  if (address.byteOffset != 0) {
+    pointer = address.byteOffset > 0
+                  ? std::format("((uint8_t*)({}) + {:#x})", base,
+                                static_cast<uint64_t>(address.byteOffset))
+                  : std::format("((uint8_t*)({}) - {:#x})", base,
+                                static_cast<uint64_t>(-address.byteOffset));
+  }
+  if (role == AddressRole::MemoryLvalue) {
+    return AddressRenderResult{
+        std::format("(*({}*)({}))", intType(width), pointer), false};
+  }
+  if (role == AddressRole::PointerValue && address.byteOffset != 0 &&
+      width != 0 && width != 8) {
+    return AddressRenderResult{
+        std::format("({}*)({})", intType(width), pointer), true};
+  }
+  return AddressRenderResult{std::move(pointer), true};
 }
 
 }  // namespace xdec::emit

@@ -99,7 +99,7 @@ int commandExec(std::string_view path, std::string_view workloadPath) {
 
   std::ifstream workload{std::filesystem::path{workloadPath}};
   if (!workload) {
-    print("error: cannot open workload '{}'", workloadPath);
+    printError("cannot open workload '{}'", workloadPath);
     return 1;
   }
 
@@ -129,7 +129,7 @@ int commandExec(std::string_view path, std::string_view workloadPath) {
 
   const auto fail = [&](std::string_view message) {
     ++failures;
-    print("error: {}", message);
+    printError("{}", message);
   };
 
   std::string line;
@@ -326,7 +326,7 @@ int commandExec(std::string_view path, std::string_view workloadPath) {
   }
 
   if (failures != 0) {
-    print("error: {} workload directive(s) failed", failures);
+    printError("{} workload directive(s) failed", failures);
     return 1;
   }
   return 0;

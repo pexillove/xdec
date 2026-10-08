@@ -24,6 +24,12 @@ struct ExternalRequest {
 struct ExternalResponse {
   ExternalAction action = ExternalAction::HandledContinue;
   uint64_t nextPc = 0;
+  /// Only meaningful with Redirect. A model that has to regain control after
+  /// the callee it redirected into returns -- a guest callback it chose to
+  /// interpret rather than forward -- sets the address of a boundary to raise
+  /// when that call's redirect frame pops. Zero keeps the plain behaviour of
+  /// resuming the original caller directly.
+  uint64_t continuationPc = 0;
   StatePatch state;
   std::vector<MemoryPatch> memory;
   /// The embedder already synchronized all current guest dirt and these effects

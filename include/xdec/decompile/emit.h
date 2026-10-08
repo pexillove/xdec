@@ -45,7 +45,7 @@
 #include "xdec/il/function.h"
 #include "xdec/pass/registry.h"
 #include "xdec/spec/engine.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 #include "xdec/support/reader.h"
 #include "xdec/support/result.h"
 

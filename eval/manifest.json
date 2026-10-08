@@ -537,7 +537,7 @@
       "name": "eval_types_fn_ptr",
       "category": "types",
       "source": "int32_t eval_types_fn_ptr(EvalBinOp op, int32_t a, int32_t b) -- returns op(a, b), a tail call through the parameter",
-      "comment": "Arity, not spelling, over a tail call. `br x0` is read as a call through the caller's pointer (recover-tailcall), so both modes get a call and a return; the arity is then the same story as any indirect call. With no declaration every one of the eight argument registers might be an argument, so the call passes eight and the enclosing signature grows to match. The header says two, and saying so before argument recovery runs is what makes both the call and the signature come out right. The baseline return is a machine word because a tail call hands back whatever the callee left in x0 and nothing here narrows it.",
+      "comment": "Arity, not spelling, over a tail call. `br x0` is read as a call through the caller's pointer (recover-tailcall), so both modes get a call and a return; the arity is then the same story as any indirect call. With no declaration the caller-side rule (passes/vars.h) keeps x0/x1, which the code writes, and x2, which it reads as its own parameter; x3..x7 are untouched entry values (x3 only holds the branch target), so the call passes three and the signature matches the source's three. The header says two, and saying so before argument recovery runs is what makes both the call and the signature come out right. The baseline return is a machine word because a tail call hands back whatever the callee left in x0 and nothing here narrows it.",
       "expect": {
         "needs_return": true
       },
@@ -547,11 +547,6 @@
           "params": [
             "64",
             "32",
-            "64",
-            "64",
-            "64",
-            "64",
-            "64",
             "64"
           ]
         }
@@ -853,7 +848,7 @@
       "name": "eval_tailcall_table",
       "category": "tailcall",
       "source": "int32_t eval_tailcall_table(const EvalTailOp* ops, int32_t index, int32_t a, int32_t b) -- returns ops[index](a, b)",
-      "comment": "A tail call through a pointer read out of an array the caller passed. `-O1` emits `ldr x4,[x0,index,lsl#3]; br x4`, which is the jump-table shape with the base in a register instead of in the instruction stream -- and that difference is the whole decision: nothing in this image says what is in the caller's array, so the branch leaves. Before recover-tailcall this failed the decompilation outright. The call still passes eight registers because no declaration says otherwise; eval_types_fn_ptr is where a header cuts that down.",
+      "comment": "A tail call through a pointer read out of an array the caller passed. `-O1` emits `ldr x4,[x0,index,lsl#3]; br x4`, which is the jump-table shape with the base in a register instead of in the instruction stream -- and that difference is the whole decision: nothing in this image says what is in the caller's array, so the branch leaves. Before recover-tailcall this failed the decompilation outright. Without a declaration the call keeps only the argument registers the caller set up or reads as its own parameters (passes/vars.h); eval_types_fn_ptr is where a header cuts it to the exact arity.",
       "expect": {
         "max_gotos": 0,
         "needs_return": true,

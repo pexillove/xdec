@@ -59,21 +59,27 @@ std::optional<int64_t> StackFrame::frameDelta(il::ExprId address, unsigned depth
       return std::nullopt;
     case il::ExprOp::Add: {
       // Exactly one side may be stack-derived; the other must be a constant.
-      const std::optional<int64_t> fromLhs = frameDelta(expr.operands[0], depth + 1);
+      // The constant is checked first so only one side is ever walked: an MBA
+      // sum tree recursed on both sides costs 2^depth.
       uint64_t constant = 0;
-      if (fromLhs.has_value() && function_->asConstant(expr.operands[1], constant)) {
-        return *fromLhs + static_cast<int64_t>(constant);
+      if (function_->asConstant(expr.operands[1], constant)) {
+        if (const std::optional<int64_t> fromLhs = frameDelta(expr.operands[0], depth + 1)) {
+          return *fromLhs + static_cast<int64_t>(constant);
+        }
       }
-      const std::optional<int64_t> fromRhs = frameDelta(expr.operands[1], depth + 1);
-      if (fromRhs.has_value() && function_->asConstant(expr.operands[0], constant)) {
-        return *fromRhs + static_cast<int64_t>(constant);
+      if (function_->asConstant(expr.operands[0], constant)) {
+        if (const std::optional<int64_t> fromRhs = frameDelta(expr.operands[1], depth + 1)) {
+          return *fromRhs + static_cast<int64_t>(constant);
+        }
       }
       return std::nullopt;
     }
     case il::ExprOp::Sub: {
-      const std::optional<int64_t> fromLhs = frameDelta(expr.operands[0], depth + 1);
       uint64_t constant = 0;
-      if (fromLhs.has_value() && function_->asConstant(expr.operands[1], constant)) {
+      if (!function_->asConstant(expr.operands[1], constant)) {
+        return std::nullopt;
+      }
+      if (const std::optional<int64_t> fromLhs = frameDelta(expr.operands[0], depth + 1)) {
         return *fromLhs - static_cast<int64_t>(constant);
       }
       return std::nullopt;

@@ -1,4 +1,6 @@
+add_subdirectory(obs)
 add_subdirectory(support)
+add_subdirectory(storage)
 add_subdirectory(binary)
 add_subdirectory(il)
 add_subdirectory(spec)

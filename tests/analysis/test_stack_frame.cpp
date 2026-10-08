@@ -59,6 +59,20 @@ TEST_CASE("sp-derived chains classify with their total displacement", "[analysis
   CHECK(other.kind == AddressKind::Other);
 }
 
+// An MBA sum shares every subtree with its sibling; classification must follow
+// only the side a constant pairs with, or this 64-deep chain costs 2^64 steps.
+TEST_CASE("a deep shared sum without constants classifies in linear time",
+          "[analysis][stack]") {
+  Fixture f;
+  ExprId sum = f.function.binary(ExprOp::Add, f.function.entryReg(f.reg("sp")),
+                                 f.function.entryReg(f.reg("x0")));
+  for (int depth = 0; depth < 64; ++depth) {
+    sum = f.function.binary(ExprOp::Add, sum, sum);
+  }
+  const StackFrame frame = StackFrame::compute(f.function);
+  CHECK(frame.classify(sum).kind == AddressKind::Other);
+}
+
 TEST_CASE("the alias oracle is three-valued and frame-image disjoint", "[analysis][stack]") {
   Fixture f;
   const ExprId entrySp = f.function.entryReg(f.reg("sp"));

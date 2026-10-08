@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 
+#include "xdec/analysis/address_expr.h"
 #include "xdec/il/function.h"
 
 namespace xdec::emit {
@@ -79,6 +80,8 @@ class AddressRenderer {
   /// call's own signature to say that was ever intended.
   [[nodiscard]] std::optional<AddressRenderResult> renderGlobal(uint64_t va, AddressRole role,
                                                                 uint32_t width) const;
+  [[nodiscard]] std::optional<AddressRenderResult> renderPointerOffset(
+      const analysis::AddressExpr& address, AddressRole role, uint32_t width) const;
 
   CContext& ctx_;
 };

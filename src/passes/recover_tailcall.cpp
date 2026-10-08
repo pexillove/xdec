@@ -11,7 +11,7 @@
 #include "xdec/analysis/dominators.h"
 #include "xdec/il/function.h"
 #include "xdec/il/printer.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 namespace xdec::passes {
 

@@ -189,7 +189,7 @@ TEST_CASE("a byte access to an untyped global indexes it instead of casting",
   };
   const std::string text = f.emit(options);
   INFO(text);
-  CHECK(contains(text, "g_400900[0] = arg1;"));
+  CHECK(contains(text, "g_400900[0x0] = arg1;"));
   CHECK(!contains(text, "*(uint8_t*)(g_400900)"));
 }
 

@@ -137,7 +137,7 @@ int commandImages(std::string_view path, uint64_t limit) {
   const BinaryImage& image = *opened.value();
   const xdec::binary::DyldCacheMetadata* cache = xdec::binary::asDyldCacheMetadata(image);
   if (cache == nullptr) {
-    print("error: '{}' is not a dyld shared cache", path);
+    printError("'{}' is not a dyld shared cache", path);
     return 1;
   }
 
@@ -161,7 +161,7 @@ int commandCacheLocate(std::string_view path, uint64_t address) {
   const BinaryImage& image = *opened.value();
   const xdec::binary::DyldCacheMetadata* cache = xdec::binary::asDyldCacheMetadata(image);
   if (cache == nullptr) {
-    print("error: '{}' is not a dyld shared cache", path);
+    printError("'{}' is not a dyld shared cache", path);
     return 1;
   }
 
@@ -268,7 +268,7 @@ int commandMemDump(std::string_view path, std::string_view outPath) {
   std::ofstream out{std::filesystem::path{outPath},
                     std::ios::binary | std::ios::trunc};
   if (!out) {
-    print("error: cannot write '{}'", outPath);
+    printError("cannot write '{}'", outPath);
     return 1;
   }
   const auto put64 = [&out](uint64_t value) {
@@ -285,7 +285,7 @@ int commandMemDump(std::string_view path, std::string_view outPath) {
     std::vector<std::byte> contents(region.size);
     auto read = image.read(region.va, contents);
     if (!read) {
-      print("error: cannot read region at {:#x}: {}", region.va, read.error().format());
+      printError("cannot read region at {:#x}: {}", region.va, read.error().format());
       return 1;
     }
     put64(region.va);
@@ -294,7 +294,7 @@ int commandMemDump(std::string_view path, std::string_view outPath) {
               static_cast<std::streamsize>(contents.size()));
     ++regions;
   }
-  print("wrote {} regions to {}", regions, outPath);
+  note("wrote {} regions to {}", regions, outPath);
   return 0;
 }
 
@@ -343,7 +343,7 @@ int commandRead(std::string_view path, uint64_t address, uint64_t size) {
   const BinaryImage& image = *opened.value();
 
   if (size == 0 || size > 1u << 20) {
-    print("error: size must be between 1 and 0x100000");
+    printError("size must be between 1 and 0x100000");
     return 1;
   }
 

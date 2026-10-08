@@ -24,14 +24,15 @@ class MachOBuilder {
   static constexpr uint64_t kDataVa = 0x1000;
   static constexpr uint64_t kDataFileOff = 0x1000;
   static constexpr uint64_t kFixupsDataOff = 0x100;
-  static constexpr uint64_t kFixupsDataSize = 78;
+  static constexpr uint64_t kFixupsDataSize = 96;
 
-  explicit MachOBuilder(uint16_t pointerFormat) : bytes_(0x2000, std::byte{0}) {
+  explicit MachOBuilder(uint16_t pointerFormat, uint32_t importsFormat = 1)
+      : bytes_(0x2000, std::byte{0}) {
     header();
     segment(0x20, "__TEXT", kTextVa, 0x1000, 0, 0x1000, /*initprot=*/5);
     segment(0x68, "__DATA", kDataVa, 0x1000, kDataFileOff, 0x1000, /*initprot=*/3);
     chainedFixupsCommand(0xb0);
-    chainedFixupsData(pointerFormat);
+    chainedFixupsData(pointerFormat, importsFormat);
   }
 
   void putSlot(uint64_t fileOffset, uint64_t word) { put64(fileOffset, word); }
@@ -89,14 +90,16 @@ class MachOBuilder {
   /// dyld_chained_starts_in_segment (one page of __DATA) + one import +
   /// its name -- everything except the chain's own pointer words, which
   /// live in __DATA's own mapped bytes (see putSlot).
-  void chainedFixupsData(uint16_t pointerFormat) {
+  void chainedFixupsData(uint16_t pointerFormat, uint32_t importsFormat) {
     const uint64_t h = kFixupsDataOff;
+    const uint32_t importSize = importsFormat == 1 ? 4 : (importsFormat == 2 ? 8 : 16);
+    const uint32_t symbolsOffset = 64 + importSize;
     put32(h + 0, 0);    // fixups_version
     put32(h + 4, 28);   // starts_offset -> dyld_chained_starts_in_image at h+28
     put32(h + 8, 64);   // imports_offset -> h+64
-    put32(h + 12, 68);  // symbols_offset -> h+68
+    put32(h + 12, symbolsOffset);
     put32(h + 16, 1);   // imports_count
-    put32(h + 20, 1);   // imports_format (DYLD_CHAINED_IMPORT)
+    put32(h + 20, importsFormat);
     put32(h + 24, 0);   // symbols_format
 
     const uint64_t startsInImage = h + 28;
@@ -108,15 +111,21 @@ class MachOBuilder {
     put32(startsInSegment, 24);          // size
     put16(startsInSegment + 4, 0x1000);  // page_size
     put16(startsInSegment + 6, pointerFormat);
-    put64(startsInSegment + 8, 0);   // segment_offset: slot 0 is __DATA's own byte 0
+    put64(startsInSegment + 8, kDataVa - kTextVa);  // image-relative __DATA offset
     put32(startsInSegment + 16, 0);  // max_valid_pointer (unused by this loader)
     put16(startsInSegment + 20, 1);  // page_count
     put16(startsInSegment + 22, 0);  // page_start[0]: chain starts at the page's own byte 0
 
     const uint64_t imports = h + 64;
-    put32(imports, 1);  // ordinal 1, not weak, name_offset 0
+    put32(imports, 1);  // ordinal 1, not weak, name_offset 0 (formats 1/2)
+    if (importsFormat == 2) {
+      put32(imports + 4, 0x1234);  // signed addend
+    } else if (importsFormat == 3) {
+      put64(imports, 1);           // ordinal 1, name_offset 0
+      put64(imports + 8, 0x1234);  // signed addend
+    }
 
-    const uint64_t symbols = h + 68;
+    const uint64_t symbols = h + symbolsOffset;
     putString(symbols, "my_import");
   }
 
@@ -151,6 +160,22 @@ TEST_CASE("a chained rebase slot reads as its decoded target, not its packed cha
   const auto imported = (*image)->importNameAt(MachOBuilder::kDataVa + 8);
   REQUIRE(imported.has_value());
   CHECK(*imported == "my_import");
+}
+
+TEST_CASE("addend-bearing chained import formats preserve import names",
+          "[binary][macho]") {
+  for (const uint32_t importsFormat : {2u, 3u}) {
+    CAPTURE(importsFormat);
+    MachOBuilder builder{/*pointerFormat=*/6, importsFormat};
+    builder.putSlot(MachOBuilder::kDataFileOff, uint64_t{1} << 63);
+
+    auto image = loadMachO(builder.buffer(), "test.dylib");
+    REQUIRE(image);
+
+    const auto imported = (*image)->importNameAt(MachOBuilder::kDataVa);
+    REQUIRE(imported.has_value());
+    CHECK(*imported == "my_import");
+  }
 }
 
 TEST_CASE("an undecoded chained pointer format leaves its slots as raw bytes",

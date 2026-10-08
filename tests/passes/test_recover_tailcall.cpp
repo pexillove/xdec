@@ -348,5 +348,8 @@ TEST_CASE("a recovered tail call carries through to Vars", "[passes][tailcall]")
 
   const Ran ran = run(space, Maturity::Vars);
   const TailCall tail = expectTailCall(ran);
-  CHECK(tail.args == 8);
+  // x0 is read as the target and x2 by the `mov`, so both are this function's
+  // parameters and may be forwarded; x1 was written. x3..x7 are untouched
+  // entry values nothing else reads (see passes/vars.h).
+  CHECK(tail.args == 3);
 }

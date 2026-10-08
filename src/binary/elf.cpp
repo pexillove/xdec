@@ -22,7 +22,7 @@
 
 #include "xdec/binary/image.h"
 #include "xdec/support/bits.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 #include "elf_format.h"
 #include "field_reader.h"

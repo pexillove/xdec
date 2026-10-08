@@ -11,6 +11,7 @@ xdec_add_executable(xdec
     cli/common.cpp
     cli/dispatch.cpp
     cli/options.cpp
+    cli/run_context.cpp
     cli/session.cpp
   DEPS
     xdec_spec
@@ -30,6 +31,24 @@ xdec_add_executable(xdec
 # executable instead.
 target_compile_definitions(xdec PRIVATE
   XDEC_SPEC_DIR="${CMAKE_SOURCE_DIR}/specs")
+
+# Stamped into the run report so a report says which build produced it.
+find_package(Git QUIET)
+set(XDEC_GIT_REV "unknown")
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" describe --always --dirty --abbrev=12
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE XDEC_GIT_REV
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if(NOT XDEC_GIT_REV)
+    set(XDEC_GIT_REV "unknown")
+  endif()
+endif()
+target_compile_definitions(xdec PRIVATE
+  XDEC_VERSION="${PROJECT_VERSION}"
+  XDEC_GIT_REV="${XDEC_GIT_REV}")
 
 # Decompiled output defaults to `#include "xdec_helpers.h"` (see
 # emit/c_printer.h). Copying it beside the built xdec.exe is what lets a user

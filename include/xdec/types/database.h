@@ -83,6 +83,11 @@ class TypeDatabase {
   [[nodiscard]] Result<void> defineAggregate(TypeId id, std::vector<StructField> fields,
                                              bool explicitOffsets = false);
 
+  /// Marks an aggregate `__attribute__((packed))` and re-lays it out. Separate
+  /// from `defineAggregate` because C lets the attribute follow the body, so
+  /// the parser may only learn of it after the fields are in.
+  [[nodiscard]] Result<void> setPacked(TypeId id);
+
   [[nodiscard]] Result<void> defineEnum(TypeId id, std::vector<EnumConstant> constants,
                                         TypeId base);
 
@@ -123,7 +128,14 @@ class TypeDatabase {
     uint64_t remainder = 0;
     [[nodiscard]] bool found() const noexcept { return !names.empty(); }
   };
-  [[nodiscard]] FieldPath fieldAt(TypeId aggregate, uint64_t offset) const;
+  /// `accessBits` is the width of the access asking, and decides between
+  /// candidates that cover the same byte: a union's arms all start at offset
+  /// zero, so declaration order is the only thing separating them otherwise,
+  /// and the arm a 32-bit read means is the one whose leaf at that offset is
+  /// 32 bits wide. Zero asks for the widest-offset candidate alone, which is
+  /// what every caller without a machine access behind it wants.
+  [[nodiscard]] FieldPath fieldAt(TypeId aggregate, uint64_t offset,
+                                  uint32_t accessBits = 0) const;
 
   // --- Declarations ------------------------------------------------------
 
@@ -179,6 +191,8 @@ class TypeDatabase {
   /// Every entry `roots` refers to, transitively and through pointers.
   [[nodiscard]] std::vector<TypeId> reachableFrom(std::span<const TypeId> roots) const;
   void computeLayout(TypeEntry& entry, bool explicitOffsets) const;
+  [[nodiscard]] FieldPath fieldSearch(TypeId aggregate, uint64_t offset, uint32_t accessBits,
+                                      unsigned depth) const;
   void formatInto(TypeId id, std::string& prefix, std::string& suffix) const;
   void collectDefinitionOrder(TypeId id, std::vector<TypeId>& order,
                               std::vector<uint8_t>& state) const;

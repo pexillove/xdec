@@ -59,3 +59,15 @@ TEST_CASE("findPointerTo answers only what pointerTo already interned",
   REQUIRE(database.findPointerTo(intType).has_value());
   CHECK(*database.findPointerTo(intType) == pointer);
 }
+
+TEST_CASE("a stripped function can bind through its generated address name",
+          "[types][binder]") {
+  TypeDatabase database;
+  const TypeId function =
+      database.functionType(database.lookup("uint64_t"), {}, /*variadic=*/false);
+  REQUIRE(database.declareFunction("sub_100004610", function).hasValue());
+
+  const TypeEntry* prototype = binder(database).prototypeAt(0x100004610);
+  REQUIRE(prototype != nullptr);
+  CHECK(prototype->kind == TypeKind::Function);
+}

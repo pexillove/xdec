@@ -69,7 +69,7 @@ std::string flagFromNzcv(il::ConditionCode code, uint64_t nzcv) {
     case il::ConditionCode::Never:
     case il::ConditionCode::Count: break;
   }
-  return result ? "1" : "0";
+  return result ? "0x1" : "0x0";
 }
 
 std::string printFlagCond(CContext& context, ExprPrinter& expressions,
@@ -78,7 +78,7 @@ std::string printFlagCond(CContext& context, ExprPrinter& expressions,
   const auto code = static_cast<il::ConditionCode>(e.immediate);
   const il::Expr& def = context.function.expr(e.operand(0));
   if (def.op != il::ExprOp::FlagDef) {
-    return "/*flagcond*/0";
+    return "/*flagcond*/0x0";
   }
   const il::FlagOp flagOp = il::flagDefOp(def.immediate);
   const unsigned width = il::flagDefWidth(def.immediate);
@@ -88,12 +88,12 @@ std::string printFlagCond(CContext& context, ExprPrinter& expressions,
     if (bundle.op == il::ExprOp::Const) {
       return flagFromNzcv(code, bundle.immediate & 0xF);
     }
-    return "/*flagbundle*/0";
+    return "/*flagbundle*/0x0";
   }
   const std::string a =
-      def.operandCount >= 1 ? expressions.integerOperand(def.operand(0)) : "0";
+      def.operandCount >= 1 ? expressions.integerOperand(def.operand(0)) : "0x0";
   const std::string b =
-      def.operandCount >= 2 ? expressions.integerOperand(def.operand(1)) : "0";
+      def.operandCount >= 2 ? expressions.integerOperand(def.operand(1)) : "0x0";
   const std::string u = intType(width);
   const std::string s = intType(width, true);
   switch (flagOp) {
@@ -112,41 +112,41 @@ std::string printFlagCond(CContext& context, ExprPrinter& expressions,
         case il::ConditionCode::UnsignedLessEqual:
           return std::format("(({}){} <= ({}){})", u, a, u, b);
         case il::ConditionCode::Negative:
-          return std::format("(({})(({}){} - ({}){}) < 0)", s, u, a, u, b);
+          return std::format("(({})(({}){} - ({}){}) < 0x0)", s, u, a, u, b);
         case il::ConditionCode::NonNegative:
-          return std::format("(({})(({}){} - ({}){}) >= 0)", s, u, a, u, b);
+          return std::format("(({})(({}){} - ({}){}) >= 0x0)", s, u, a, u, b);
         default:
           return ccHelper(context, code, width, a, b);
       }
     case il::FlagOp::Logical:
       switch (code) {
         case il::ConditionCode::Equal:
-          return std::format("({} == 0)", a);
+          return std::format("({} == 0x0)", a);
         case il::ConditionCode::NotEqual:
-          return std::format("({} != 0)", a);
+          return std::format("({} != 0x0)", a);
         case il::ConditionCode::Negative:
-          return std::format("(({}){} < 0)", s, a);
+          return std::format("(({}){} < 0x0)", s, a);
         case il::ConditionCode::NonNegative:
-          return std::format("(({}){} >= 0)", s, a);
+          return std::format("(({}){} >= 0x0)", s, a);
         case il::ConditionCode::CarrySet:
         case il::ConditionCode::Overflow:
-          return "0 /*C,V=0*/";
+          return "0x0 /*C,V=0*/";
         case il::ConditionCode::CarryClear:
         case il::ConditionCode::NoOverflow:
-          return "1 /*C,V=0*/";
+          return "0x1 /*C,V=0*/";
         default:
-          return ccHelper(context, code, width, a, "0");
+          return ccHelper(context, code, width, a, "0x0");
       }
     case il::FlagOp::Add:
       switch (code) {
         case il::ConditionCode::Equal:
-          return std::format("(({})({} + {}) == 0)", u, a, b);
+          return std::format("(({})({} + {}) == 0x0)", u, a, b);
         case il::ConditionCode::NotEqual:
-          return std::format("(({})({} + {}) != 0)", u, a, b);
+          return std::format("(({})({} + {}) != 0x0)", u, a, b);
         case il::ConditionCode::Negative:
-          return std::format("(({})(({})({} + {})) < 0)", s, u, a, b);
+          return std::format("(({})(({})({} + {})) < 0x0)", s, u, a, b);
         case il::ConditionCode::NonNegative:
-          return std::format("(({})(({})({} + {})) >= 0)", s, u, a, b);
+          return std::format("(({})(({})({} + {})) >= 0x0)", s, u, a, b);
         default:
           return ccHelper(context, code, width, a, b);
       }

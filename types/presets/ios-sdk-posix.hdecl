@@ -1,0 +1,25 @@
+// Darwin/POSIX declarations layered on types/presets/ios-sdk.hdecl.
+
+struct stat;
+typedef struct __dirstream DIR;
+
+int _chmod(const char *path, mode_t mode);
+int _close(int fd);
+int _closedir(DIR *dirp);
+int _dirfd(DIR *dirp);
+int _fchmod(int fd, mode_t mode);
+int _fcntl(int fd, int command, ...);
+int _fstat(int fd, struct stat *buf);
+int _ftruncate(int fd, off_t length);
+int _lstat(const char *path, struct stat *buf);
+int _mkdir(const char *path, mode_t mode);
+int _open(const char *path, int flags, ...);
+int _open_dprotected_np(const char *path, int flags, int protection_class,
+                        int dprotected_flags, ...);
+DIR *_opendir(const char *path);
+ssize_t _read(int fd, void *buffer, size_t count);
+long _strtol(const char *text, char **end, int base);
+mode_t _umask(mode_t mask);
+int _unlink(const char *path);
+ssize_t _write(int fd, const void *buffer, size_t count);
+int _ptrace(int request, pid_t pid, void *address, int data);

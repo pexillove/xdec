@@ -10,6 +10,7 @@
 // resolve to them.
 #include "xdec/spec/lift.h"
 
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <map>
@@ -125,8 +126,12 @@ namespace {
 class Discovery {
  public:
   Discovery(const SpecEngine& engine, const ByteReader& reader, il::Function& function,
-            const MemoryFacts& facts)
-      : engine_(engine), reader_(reader), function_(function), facts_(facts) {
+            const MemoryFacts& facts, const LiftCoverage* coverage)
+      : engine_(engine),
+        reader_(reader),
+        function_(function),
+        facts_(facts),
+        coverage_(coverage != nullptr && coverage->active() ? coverage : nullptr) {
     const SpecProgram& program = engine_.program();
     width_ = program.insnWidth / 8;
 
@@ -151,7 +156,8 @@ class Discovery {
   void scan(std::span<const uint64_t> entries) {
     std::deque<uint64_t> worklist;
     for (const uint64_t entry : entries) {
-      if (!extents_.contains(entry) && readable(entry)) {
+      if (!extents_.contains(entry) && readable(entry) &&
+          (coverage_ == nullptr || coverage_->contains(entry))) {
         leaders_.insert(entry);
         worklist.push_back(entry);
       }
@@ -169,6 +175,9 @@ class Discovery {
         // Ran into a leader discovered by an earlier scan: this block ends
         // just short of it, with a fall-through edge spelled out in phase two.
         if (at != start && leaders_.contains(at)) {
+          break;
+        }
+        if (coverage_ != nullptr && !coverage_->contains(at)) {
           break;
         }
         std::array<std::byte, 16> storage{};
@@ -193,10 +202,25 @@ class Discovery {
         if (!flow.terminates()) {
           continue;
         }
-        if (flow.kind == FlowKind::IndirectBranch || flow.kind == FlowKind::Unknown) {
-          unresolved_.push_back(start);
+        std::vector<uint64_t> targets;
+        if (coverage_ != nullptr) {
+          targets = coverage_->successors(at - width_);
+          // Elaboration still needs handles for both statically encoded arms.
+          // Arms not taken by the trace are boundary stubs and are removed
+          // from the terminator immediately after elaboration.
+          for (const uint64_t encoded : {flow.target, flow.fallthrough}) {
+            if (encoded != 0 &&
+                std::ranges::find(targets, encoded) == targets.end()) {
+              external_.insert(encoded);
+            }
+          }
+        } else {
+          if (flow.kind == FlowKind::IndirectBranch || flow.kind == FlowKind::Unknown) {
+            unresolved_.push_back(start);
+          }
+          targets = {flow.target, flow.fallthrough};
         }
-        for (const uint64_t target : {flow.target, flow.fallthrough}) {
+        for (const uint64_t target : targets) {
           if (target == 0) {
             continue;
           }
@@ -288,6 +312,36 @@ class Discovery {
           function_.appendUnreachable(block, attributedTo);
         }
       }
+      if (coverage_ != nullptr) {
+        il::Block& observed = function_.block(block);
+        if (!observed.ops.empty()) {
+          const il::OpId terminatorId = observed.ops.back();
+          il::Op& terminator = function_.op(terminatorId);
+          if (terminator.isTerminator() &&
+              (terminator.code == il::OpCode::Branch ||
+               terminator.code == il::OpCode::CondBranch ||
+               terminator.code == il::OpCode::IndirectBranch)) {
+            const std::vector<uint64_t> successors =
+                coverage_->successors(terminator.va);
+            std::vector<il::BlockId> targets;
+            targets.reserve(successors.size());
+            for (const uint64_t successor : successors) {
+              const il::BlockId target = site.blockAt(successor);
+              if (target.valid()) {
+                targets.push_back(target);
+              }
+            }
+            if (targets.size() == 1) {
+              terminator.code = il::OpCode::Branch;
+              function_.setOperands(terminatorId, {});
+              function_.setTargets(terminatorId, targets);
+            } else if (!targets.empty() &&
+                       terminator.code == il::OpCode::IndirectBranch) {
+              function_.setTargets(terminatorId, targets);
+            }
+          }
+        }
+      }
     }
     function_.rebuildEdges();
     return lifted;
@@ -313,6 +367,7 @@ class Discovery {
   const ByteReader& reader_;
   il::Function& function_;
   const MemoryFacts& facts_;
+  const LiftCoverage* coverage_ = nullptr;
   unsigned width_ = 0;
 
   std::set<uint64_t> leaders_;
@@ -326,12 +381,13 @@ class Discovery {
 }  // namespace
 
 Result<LiftedFunction> liftFunction(const SpecEngine& engine, const ByteReader& reader,
-                                    uint64_t entry, const MemoryFacts& facts) {
+                                    uint64_t entry, const MemoryFacts& facts,
+                                    const LiftCoverage* coverage) {
   auto function =
       std::make_unique<il::Function>(engine.program().arch, engine.program().registers, entry);
   function->setMaturity(il::Maturity::Lifted);
 
-  Discovery discovery(engine, reader, *function, facts);
+  Discovery discovery(engine, reader, *function, facts, coverage);
   if (!discovery.valid()) {
     return err(DiagCode::Internal, "unsupported instruction width");
   }
@@ -356,8 +412,9 @@ Result<LiftedFunction> liftFunction(const SpecEngine& engine, const ByteReader& 
 Result<LiftBlocksResult> liftBlocksInto(il::Function& function, const SpecEngine& engine,
                                         const ByteReader& reader,
                                         std::span<const uint64_t> entries,
-                                        const MemoryFacts& facts) {
-  Discovery discovery(engine, reader, function, facts);
+                                        const MemoryFacts& facts,
+                                        const LiftCoverage* coverage) {
+  Discovery discovery(engine, reader, function, facts, coverage);
   if (!discovery.valid()) {
     return err(DiagCode::Internal, "unsupported instruction width");
   }

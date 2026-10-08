@@ -1,0 +1,29 @@
+// CoreFoundation declarations used beyond the compact ios-sdk core.
+
+typedef struct __CFURL *CFURLRef;
+typedef struct __CFBoolean *CFBooleanRef;
+typedef struct __CFError *CFErrorRef;
+typedef uint32_t CFStringEncoding;
+
+CFStringRef _CFStringCreateWithCStringNoCopy(CFAllocatorRef allocator,
+                                              const char *text,
+                                              CFStringEncoding encoding,
+                                              CFAllocatorRef contentsDeallocator);
+Boolean _CFStringGetCString(CFStringRef string, char *buffer, CFIndex bufferSize,
+                            CFStringEncoding encoding);
+CFIndex _CFStringGetLength(CFStringRef string);
+CFTypeID _CFStringGetTypeID(void);
+
+CFURLRef _CFURLCreateFromFileSystemRepresentation(CFAllocatorRef allocator,
+                                                   const unsigned char *bytes,
+                                                   CFIndex length,
+                                                   Boolean isDirectory);
+Boolean _CFURLSetResourcePropertyForKey(CFURLRef url, CFStringRef key,
+                                        CFTypeRef value, CFErrorRef *error);
+
+extern CFAllocatorRef _kCFAllocatorDefault;
+extern CFAllocatorRef _kCFAllocatorNull;
+extern CFBooleanRef _kCFBooleanTrue;
+extern CFStringRef _kCFRunLoopCommonModes;
+extern CFStringRef _kCFURLIsExcludedFromBackupKey;
+extern void *___CFConstantStringClassReference;

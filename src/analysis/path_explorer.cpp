@@ -12,8 +12,13 @@
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/sym_value.h"
 #include "xdec/binary/cache_pointer.h"
+#include "xdec/obs/job.h"
+#include "xdec/obs/metrics.h"
+#include "xdec/obs/span.h"
 
 namespace xdec::analysis {
+
+XDEC_DEFINE_COUNTER(pathExploreSteps, "path_explore.steps")
 
 namespace {
 
@@ -124,6 +129,7 @@ void PathExplorer::explore() {
   if (!options_.enabled || !function_->entryBlock().valid()) {
     return;
   }
+  XDEC_SPAN(exploreSpan, "analysis", "path-explore", "blocks", function_->blockCount());
 
   // One snapshot of every canary check's likely mismatch arm, taken once
   // up front -- same reasoning resolve-indirect's own Dominators/ImageEval
@@ -153,9 +159,11 @@ void PathExplorer::explore() {
                               PathState(*function_, reader_, entryRegs_)});
 
   while (!worklist.empty() && pathsExplored_ < options_.maxPaths) {
+    obs::checkpoint("path-explore");
     Frontier item = std::move(worklist.back());
     worklist.pop_back();
     ++pathsExplored_;
+    pathExploreSteps().add();
 
     PathState& state = item.state;
     if (state.steps >= options_.maxStepsPerPath) {
@@ -234,6 +242,8 @@ void PathExplorer::explore() {
         break;
     }
   }
+  exploreSpan.set("paths", pathsExplored_);
+  exploreSpan.set("resolved_branches", results_.size());
 }
 
 }  // namespace xdec::analysis

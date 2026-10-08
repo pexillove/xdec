@@ -289,6 +289,32 @@ bool GuestAddressSpace::readResidentBytes(uint64_t address,
   return true;
 }
 
+Result<void> GuestAddressSpace::refresh(uint64_t address, uint64_t size) {
+  if (size == 0 || !provider_) {
+    return ok();
+  }
+  address = canonicalize(address);
+  if (address > std::numeric_limits<uint64_t>::max() - (size - 1)) {
+    return err(DiagCode::OutOfRange, "guest refresh wraps the address space");
+  }
+  const uint64_t last = pageBase(address + size - 1);
+  for (uint64_t page = pageBase(address);; page += kPageSize) {
+    auto found = pages_.find(page);
+    if (found != pages_.end()) {
+      XDEC_TRY(auto supplied, provider_(page));
+      if (supplied.has_value()) {
+        found->second.bytes = supplied->bytes;
+        found->second.permissions = supplied->permissions;
+        found->second.generation = freshGeneration();
+      }
+    }
+    if (page == last) {
+      break;
+    }
+  }
+  return ok();
+}
+
 Result<void> GuestAddressSpace::writeBytes(uint64_t address,
                                            std::span<const std::byte> bytes) {
   address = canonicalize(address);

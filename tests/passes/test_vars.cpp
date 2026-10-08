@@ -60,13 +60,16 @@ struct Builder {
 
 /// The whole stock pipeline, up to and including vars. No image is wired: the
 /// only call target these tests use is a constant, so nothing needs reading.
-void runToVars(Function& function) {
+void runToVars(Function& function, xdec::pass::NameAt names = {}) {
   xdec::pass::Registry registry;
   xdec::passes::registerBuiltinPasses(registry);
   xdec::pass::Manager manager;
   manager.setImage([](uint64_t, std::span<std::byte>) -> xdec::Result<void> {
     return xdec::err(xdec::DiagCode::Internal, "no image in this test");
   });
+  if (names) {
+    manager.setNames(std::move(names));
+  }
   auto ran = manager.runTo(function, registry, Maturity::Vars);
   const std::string error = ran ? std::string{} : ran.error().format();
   INFO(error);
@@ -98,10 +101,10 @@ void runToVars(Function& function) {
 
 }  // namespace
 
-// Nothing wrote any argument register, and the entry values are what the
-// registers hold: every slot was set up by *somebody*, namely this function's
-// own caller, so nothing is trimmed. Being unable to distinguish forwarding from
-// an untouched register is exactly why entry values count as evidence.
+// Nothing wrote any argument register and no call came first, so every slot
+// holds whatever this function was entered with. With no slot written there is
+// no argument list of the caller's own to measure against: forwarding all of
+// them and forwarding none look the same from here, so nothing is trimmed.
 TEST_CASE("a call with no argument registers written keeps its entry values",
           "[passes][vars]") {
   Builder b;
@@ -113,6 +116,64 @@ TEST_CASE("a call with no argument registers written keeps its entry values",
   runToVars(b.function);
 
   CHECK(arity(b.function) == 8);
+}
+
+// The adid MIG shape: two slots set up, the next one untouched. The untouched
+// x7 is not an argument of the callee, and so not a read of this function's.
+TEST_CASE("an untouched slot above the set-up ones is trimmed", "[passes][vars]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  b.set(entry, 0x1000, "x0", 1);
+  b.set(entry, 0x1004, "x6", 2);
+  b.function.appendCall(entry, 0x1008, b.i64(0x2000), Type::integer(64));
+  b.function.appendReturn(entry, 0x100c);
+  b.atCfg();
+
+  runToVars(b.function);
+
+  CHECK(arity(b.function) == 7);
+}
+
+// An untouched register the body also reads is one of this function's own
+// parameters, and forwarding it is plausible: the slot stays.
+TEST_CASE("an untouched slot the body reads elsewhere is kept", "[passes][vars]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const il::ValueId x2 = b.function.appendReadReg(entry, 0x1000, b.reg("x2"));
+  b.function.appendStore(entry, 0x1004, Type::integer(64), b.i64(0x8000),
+                         b.function.valueRef(x2));
+  b.set(entry, 0x1008, "x0", 1);
+  b.function.appendCall(entry, 0x100c, b.i64(0x2000), Type::integer(64));
+  b.function.appendReturn(entry, 0x1010);
+  b.atCfg();
+
+  runToVars(b.function);
+
+  CHECK(arity(b.function) == 3);
+}
+
+// A stack probe in the prologue keeps every register but x16/x17 (see
+// analysis/call_abi.h). Modelled as an ordinary call it would leave x0 Undef
+// at the real call after it; here x0 is still the entry value, and the probe
+// itself carries no arguments.
+TEST_CASE("a stack-probe helper destroys no argument register", "[passes][vars]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const OpId probe = b.function.appendCall(entry, 0x1000, b.i64(0x2000), Type::integer(64));
+  b.set(entry, 0x1004, "x1", 5);
+  const OpId call = b.function.appendCall(entry, 0x1008, b.i64(0x3000), Type::integer(64));
+  b.function.appendReturn(entry, 0x100c);
+  b.atCfg();
+
+  runToVars(b.function, [](uint64_t va) {
+    return va == 0x2000 ? xdec::pass::SymbolName{"___chkstk_darwin", true}
+                        : xdec::pass::SymbolName{};
+  });
+
+  CHECK(b.function.operands(b.function.op(probe)).size() == 1);
+  const auto operands = b.function.operands(b.function.op(call));
+  REQUIRE(operands.size() - 1 == 2);
+  CHECK(b.function.expr(operands[1]).op == ExprOp::EntryReg);
 }
 
 // The case the pass exists for: a call whose upper argument slots are a previous

@@ -86,6 +86,17 @@ TEST_CASE("field lookup by byte offset descends into nested aggregates", "[types
 
   const TypeDatabase::FieldPath past = database.fieldAt(outer, 64);
   REQUIRE_FALSE(past.found());
+
+  // An access as wide as the nested aggregate is that aggregate, not its
+  // first member: descending would name one field of a read that covers all
+  // of them. Without a width to ask about, the deepest path is still the
+  // answer, since nothing says otherwise.
+  const TypeDatabase::FieldPath whole = database.fieldAt(outer, 0, 64);
+  REQUIRE(whole.names == std::vector<std::string>{"header"});
+  const TypeDatabase::FieldPath member = database.fieldAt(outer, 0, 32);
+  REQUIRE(member.names == std::vector<std::string>{"header", "magic"});
+  const TypeDatabase::FieldPath untyped = database.fieldAt(outer, 0);
+  REQUIRE(untyped.names == std::vector<std::string>{"header", "magic"});
 }
 
 TEST_CASE("C declarator spelling round-trips through the spiral rule", "[types]") {

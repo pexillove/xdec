@@ -526,11 +526,11 @@ TEST_CASE("an If arm that fell back to a bare goto folds its single-reference "
   }
   const Stmt* ifStmt = findIf(result.root.get(), dispatcher);
   REQUIRE(ifStmt != nullptr);
-  // Neither arm is still a bare `goto` naming its target -- both folded in.
+  // Neither path is still a bare `goto` naming its target. The leaving arm
+  // remains the guard body and the other folded arm is promoted after it.
   REQUIRE(ifStmt->thenArm != nullptr);
-  REQUIRE(ifStmt->elseArm != nullptr);
+  CHECK(ifStmt->elseArm == nullptr);
   CHECK(ifStmt->thenArm->kind != StmtKind::Goto);
-  CHECK(ifStmt->elseArm->kind != StmtKind::Goto);
   CHECK_FALSE(result.isLabeled(handler));
   CHECK_FALSE(result.isLabeled(exit));
   // `sink` is folded whole into `handler`'s own arm as plain fallthrough

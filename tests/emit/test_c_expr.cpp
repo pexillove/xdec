@@ -217,7 +217,7 @@ TEST_CASE("a zero-extended value compared to zero drops the cast",
   CHECK(!contains(text, "(uint32_t)"));
 }
 
-TEST_CASE("a zero-extended value compared to a nonzero constant keeps the cast",
+TEST_CASE("a zero-extended value compared to a representable constant drops the cast",
           "[emit][expr]") {
   Fixture f;
   const ExprId narrow =
@@ -227,7 +227,21 @@ TEST_CASE("a zero-extended value compared to a nonzero constant keeps the cast",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "((uint32_t)(arg1)) == 0x5)"));
+  CHECK(contains(text, "(arg1 == 0x5)"));
+  CHECK(!contains(text, "(uint32_t)"));
+}
+
+TEST_CASE("a zero-extended value compared beyond its source width keeps the cast",
+          "[emit][expr]") {
+  Fixture f;
+  const ExprId narrow =
+      f.function.cast(ExprOp::Trunc, Type::integer(8), f.entryReg("x0"));
+  const ExprId widened = f.function.cast(ExprOp::ZExt, Type::integer(32), narrow);
+  f.observe(f.function.binary(ExprOp::CmpEq, widened, f.i64(0x100)), 8);
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "((uint32_t)(arg1)) == 0x100)"));
 }
 
 TEST_CASE("signed division casts both operands", "[emit][expr]") {
@@ -375,7 +389,7 @@ TEST_CASE("concat places the high operand above the low operand's width",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "((uint64_t)(arg2) << 32) | (uint64_t)(arg1)"));
+  CHECK(contains(text, "((uint64_t)(arg2) << 0x20) | (uint64_t)(arg1)"));
 }
 
 TEST_CASE("a preserving register view writes through a masked insert",
@@ -391,8 +405,8 @@ TEST_CASE("a preserving register view writes through a masked insert",
   const std::string text = f.emit();
   INFO(text);
   CHECK(contains(text,
-                 "q0 = (q0 & ~(((uint128_t)((((uint128_t)1) << 64) - 1)) << 64)) |"));
-  CHECK(contains(text, "t0 = ((uint64_t)((q0 >> 64)));"));
+                 "q0 = (q0 & ~(((uint128_t)((((uint128_t)0x1) << 0x40) - 0x1)) << 0x40)) |"));
+  CHECK(contains(text, "t0 = ((uint64_t)((q0 >> 0x40)));"));
 }
 
 }  // namespace

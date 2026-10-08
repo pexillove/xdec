@@ -130,7 +130,7 @@ TEST_CASE("an unknown syscall alone does not pull in the helpers header",
   const std::string text = f.emit();
   INFO(text);
   CHECK(!contains(text, "xdec_helpers.h"));
-  CHECK(contains(text, "__xdec_syscall(9999"));
+  CHECK(contains(text, "__xdec_syscall(0x270f"));
 }
 
 TEST_CASE("helpersHeader can be overridden to a different path",

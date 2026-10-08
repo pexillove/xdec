@@ -122,7 +122,8 @@ Result<void> ExecSession::applyResponse(const ExternalRequest& request,
   if (response.action == ExternalAction::Redirect) {
     if (request.kind == BoundaryKind::DirectCall ||
         request.kind == BoundaryKind::IndirectCall) {
-      redirectedCallReturns_.push_back(request.returnPc);
+      redirectedCallReturns_.push_back(
+          RedirectFrame{request.returnPc, response.continuationPc});
     }
     nextState.setPc(response.nextPc);
   } else if (response.action == ExternalAction::ReturnFromCall) {
@@ -132,7 +133,7 @@ Result<void> ExecSession::applyResponse(const ExternalRequest& request,
     // next enclosing RET sees a stale stack entry and is mistaken for the
     // session's outermost return.
     if (!redirectedCallReturns_.empty() &&
-        redirectedCallReturns_.back() == request.returnPc) {
+        redirectedCallReturns_.back().returnPc == request.returnPc) {
       redirectedCallReturns_.pop_back();
     }
     nextState.setPc(request.returnPc);
@@ -484,6 +485,52 @@ ExecResult ExecSession::runLoop() {
       exportState(interpreter, state_, block->writtenRoots);
     }
 
+    if (observer_ != nullptr) {
+      // Emit from the interpreter outcome, before any external handler can
+      // redirect or model it. A trace consumer must never have to infer this
+      // edge from whichever instruction happens to be recorded next.
+      std::optional<ControlTransferRecord> transfer;
+      switch (outcome.stop) {
+        case il::ExecStop::Branch:
+          transfer = ControlTransferRecord{
+              outcome.va, outcome.target, ControlTransferKind::DirectBranch};
+          break;
+        case il::ExecStop::CondBranch:
+          transfer = ControlTransferRecord{
+              outcome.va,
+              outcome.condition ? outcome.target : outcome.fallthrough,
+              ControlTransferKind::ConditionalBranch};
+          break;
+        case il::ExecStop::IndirectBranch:
+          transfer = ControlTransferRecord{
+              outcome.va, outcome.target, ControlTransferKind::IndirectBranch};
+          observer_->onIndirectTransfer(IndirectTransferRecord{
+              outcome.va, outcome.target, IndirectTransferKind::Branch});
+          break;
+        case il::ExecStop::Call: {
+          transfer = ControlTransferRecord{
+              outcome.va, outcome.target, ControlTransferKind::Call};
+          const ExecInstruction* source = block->instructionAt(outcome.va);
+          if (source == nullptr || !source->flow.callTargetKnown) {
+            observer_->onIndirectTransfer(IndirectTransferRecord{
+                outcome.va, outcome.target, IndirectTransferKind::Call});
+          }
+          break;
+        }
+        case il::ExecStop::Return: {
+          const auto link = state_.read("x30");
+          if (link) {
+            transfer = ControlTransferRecord{
+                outcome.va, link->lo, ControlTransferKind::Return};
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      if (transfer) observer_->onControlTransfer(*transfer);
+    }
+
     if (outcome.stop == il::ExecStop::Branch) {
       if (options_.externalBranch &&
           options_.externalBranch(outcome.va, outcome.target)) {
@@ -585,9 +632,48 @@ ExecResult ExecSession::runLoop() {
     if (outcome.stop == il::ExecStop::Return) {
       const auto lr = state_.read("x30");
       if (!redirectedCallReturns_.empty() && lr &&
-          lr->lo == redirectedCallReturns_.back()) {
-        state_.setPc(redirectedCallReturns_.back());
+          lr->lo == redirectedCallReturns_.back().returnPc) {
+        const RedirectFrame frame = redirectedCallReturns_.back();
         redirectedCallReturns_.pop_back();
+        if (frame.continuationPc == 0) {
+          state_.setPc(frame.returnPc);
+          continue;
+        }
+        // The model that redirected into this callee asked to finish the
+        // call itself. It observes the callee's result and decides what the
+        // original caller sees, which a plain resume cannot express.
+        ExternalRequest request;
+        request.kind = BoundaryKind::DirectCall;
+        request.pc = outcome.va;
+        request.returnPc = frame.returnPc;
+        request.target = frame.continuationPc;
+        request.dirty = collectDirty();
+        if (observer_ != nullptr) {
+          observer_->onBoundary(BoundaryRecord{request.pc, request.returnPc,
+                                               request.target, request.kind,
+                                               "callback-return"});
+        }
+        state_.setPc(request.pc);
+        if (handler_ == nullptr) {
+          return suspend(std::move(request), SessionStop::ExternalBoundary);
+        }
+        auto response = handler_->handle(request, state_, *memory_);
+        if (!response) {
+          observeEffect(request, nullptr, response.error().format());
+          ExecResult result = suspend(request, SessionStop::HandlerStop);
+          result.detail = response.error().format();
+          return result;
+        }
+        if (auto applied = applyResponse(request, *response); !applied) {
+          observeEffect(request, nullptr, applied.error().format());
+          ExecResult result = suspend(request, SessionStop::Fault);
+          result.detail = applied.error().format();
+          return result;
+        }
+        observeEffect(request, &*response);
+        if (response->action == ExternalAction::Stop) {
+          return suspend(std::move(request), SessionStop::HandlerStop);
+        }
         continue;
       }
       state_.setPc(outcome.va);

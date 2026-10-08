@@ -3,25 +3,30 @@
 #include "xdec/passes/vars.h"
 
 #include <format>
+#include <optional>
+#include <set>
+#include <unordered_set>
 #include <vector>
 
+#include "xdec/analysis/import_callee.h"
 #include "xdec/il/function.h"
+#include "xdec/types/binder.h"
+#include "xdec/types/database.h"
+
+#include "call_names.h"
 
 namespace xdec::passes {
 
 namespace {
 
-/// Whether the expression in an argument slot is evidence that the caller put
-/// something there.
-///
-/// Only Undef says no. Undef is not "a value we failed to track" — SSA
-/// construction writes it exactly where nothing on any path defines the
-/// register, which after a call is the ABI's own statement that the callee may
-/// have left anything in it. Every other expression, entry values included, is
-/// something that reached the register by an explicit route.
-[[nodiscard]] bool isSetUp(const il::Function& function, il::ExprId slot) {
-  return function.expr(slot).op != il::ExprOp::Undef;
-}
+/// Operand zero of a Call (and of an unresolved IndirectBranch) is its target;
+/// the rest are the argument registers' versions SSA construction attached.
+constexpr std::size_t kFirstArgOperand = 1;
+
+/// Every (op, operand index) whose argument slot still holds its own register's
+/// entry value, untouched: no instruction in this function wrote it and no
+/// call on any path before this one could have destroyed it.
+using SlotSet = std::set<std::pair<uint32_t, std::size_t>>;
 
 class Vars final : public pass::FunctionPass {
  public:
@@ -41,31 +46,219 @@ class Vars final : public pass::FunctionPass {
 
   Result<bool> run(pass::Context& context) override {
     il::Function& function = context.function();
+    const analysis::CallNameSources names = callNameSources(context);
+    const SlotSet untouched = untouchedSlots(function, names);
+    const std::unordered_set<uint32_t> readElsewhere = entryRegsReadOutside(function, untouched);
+
+    std::optional<types::TypeBinder> binder;
+    const types::TypeEntry* self = nullptr;
+    if (const types::TypeDatabase* database = context.typeDatabase()) {
+      binder.emplace(*database, [&context](uint64_t va) {
+        const pass::SymbolName symbol = context.nameAt(va);
+        return types::BoundName{symbol.name, symbol.isFunction};
+      });
+      self = binder->prototypeAt(function.block(function.entryBlock()).va);
+    }
+
     bool changed = false;
     for (const il::BlockId blockId : function.blockHandles()) {
       for (const il::OpId opId : function.block(blockId).ops) {
-        if (function.op(opId).code == il::OpCode::Call) {
-          changed |= recoverArity(function, opId);
+        if (function.op(opId).code != il::OpCode::Call) {
+          continue;
         }
+        std::size_t declared = 0;
+        if (binder) {
+          const auto operands = function.operands(function.op(opId));
+          if (const types::TypeEntry* callee = analysis::resolveCallee(
+                  function, *binder, self, context.memoryFacts(), operands[0])) {
+            declared = callee->params.size();
+          }
+        }
+        changed |= recoverArity(function, opId, declared, untouched, readElsewhere);
       }
     }
     return changed;
   }
 
  private:
+  /// Whether a call can destroy the argument registers, which is every call
+  /// but the helpers analysis/call_abi.h lists.
+  static bool clobbersArguments(const il::Function& function, const il::Op& call,
+                                const analysis::CallNameSources& names) {
+    const auto operands = function.operands(call);
+    if (operands.empty()) {
+      return true;
+    }
+    const std::optional<std::string> name =
+        analysis::callTargetName(function, operands[0], names);
+    return !name.has_value() || !analysis::isRegisterPreservingHelper(*name);
+  }
+
+  /// A slot holding its own register's entry value is ambiguous only where
+  /// nothing could have replaced that value first. After a clobbering call the
+  /// register is dead by the ABI, so the same entry value arriving there was
+  /// saved and put back on purpose: that is a set-up argument.
+  static SlotSet untouchedSlots(const il::Function& function,
+                                const analysis::CallNameSources& names) {
+    std::set<il::BlockId> callBlocks;
+    for (const il::BlockId blockId : function.blockHandles()) {
+      for (const il::OpId opId : function.block(blockId).ops) {
+        const il::Op& op = function.op(opId);
+        if (op.code == il::OpCode::Call && clobbersArguments(function, op, names)) {
+          callBlocks.insert(blockId);
+          break;
+        }
+      }
+    }
+    // Blocks some clobbering call reaches along at least one edge. A call in a
+    // loop reaches its own block, which is right: its second iteration runs
+    // after its first.
+    std::set<il::BlockId> afterCall;
+    std::vector<il::BlockId> worklist;
+    for (const il::BlockId blockId : callBlocks) {
+      for (const il::BlockId succ : function.block(blockId).successors) {
+        if (afterCall.insert(succ).second) {
+          worklist.push_back(succ);
+        }
+      }
+    }
+    while (!worklist.empty()) {
+      const il::BlockId blockId = worklist.back();
+      worklist.pop_back();
+      for (const il::BlockId succ : function.block(blockId).successors) {
+        if (afterCall.insert(succ).second) {
+          worklist.push_back(succ);
+        }
+      }
+    }
+
+    SlotSet out;
+    for (const il::BlockId blockId : function.blockHandles()) {
+      bool preceded = afterCall.contains(blockId);
+      for (const il::OpId opId : function.block(blockId).ops) {
+        const il::Op& op = function.op(opId);
+        const bool isCall = op.code == il::OpCode::Call;
+        if (!preceded && (isCall || op.code == il::OpCode::IndirectBranch)) {
+          const auto operands = function.operands(op);
+          for (std::size_t index = kFirstArgOperand; index < operands.size(); ++index) {
+            const il::Expr& expr = function.expr(operands[index]);
+            if (expr.op != il::ExprOp::EntryReg) {
+              continue;
+            }
+            const il::RegId root{static_cast<uint32_t>(expr.immediate)};
+            if (analysis::calleeArgumentIndex(function, root) ==
+                static_cast<int>(index - kFirstArgOperand)) {
+              out.emplace(opId.index(), index);
+            }
+          }
+        }
+        if (isCall && clobbersArguments(function, op, names)) {
+          preceded = true;
+        }
+      }
+    }
+    return out;
+  }
+
+  /// The entry registers this function reads anywhere other than an untouched
+  /// argument slot: its own parameters, by the only evidence the body has.
+  static std::unordered_set<uint32_t> entryRegsReadOutside(const il::Function& function,
+                                                           const SlotSet& untouched) {
+    std::unordered_set<uint32_t> roots;
+    std::unordered_set<uint32_t> seen;
+    std::vector<il::ExprId> stack;
+    for (const il::BlockId blockId : function.blockHandles()) {
+      for (const il::OpId opId : function.block(blockId).ops) {
+        const auto operands = function.operands(function.op(opId));
+        for (std::size_t index = 0; index < operands.size(); ++index) {
+          if (!untouched.contains({opId.index(), index})) {
+            stack.push_back(operands[index]);
+          }
+        }
+      }
+    }
+    while (!stack.empty()) {
+      const il::ExprId id = stack.back();
+      stack.pop_back();
+      if (!id.valid() || !seen.insert(id.index()).second) {
+        continue;
+      }
+      const il::Expr& expr = function.expr(id);
+      if (expr.op == il::ExprOp::EntryReg) {
+        roots.insert(static_cast<uint32_t>(expr.immediate));
+        continue;
+      }
+      for (unsigned index = 0; index < expr.operandCount; ++index) {
+        stack.push_back(expr.operand(index));
+      }
+    }
+    return roots;
+  }
+
+  /// Whether the expression in an argument slot is evidence that the caller put
+  /// something there.
+  ///
+  /// Undef says no. Undef is not "a value we failed to track" — SSA
+  /// construction writes it exactly where nothing on any path defines the
+  /// register, which after a call is the ABI's own statement that the callee may
+  /// have left anything in it.
+  ///
+  /// An untouched slot says no too, unless the register is one of this
+  /// function's own parameters. Before any call, x7 still holding whatever this
+  /// function was entered with is what every call in a two-argument function
+  /// sees; counting it would give the callee an eighth argument, and then give
+  /// this function one as well, since the slot is also a read of x7.
+  ///
+  /// A prototype's declared parameters outrank that: forwarding one's own
+  /// arguments untouched is exactly what a header describes a call doing.
+  static bool isSetUp(const il::Function& function, il::OpId opId, std::size_t index,
+                      il::ExprId slot, std::size_t declared, const SlotSet& untouched,
+                      const std::unordered_set<uint32_t>& readElsewhere) {
+    const il::Expr& expr = function.expr(slot);
+    if (expr.op == il::ExprOp::Undef) {
+      return false;
+    }
+    if (index - kFirstArgOperand >= declared) {
+      if (untouched.contains({opId.index(), index})) {
+        return readElsewhere.contains(static_cast<uint32_t>(expr.immediate));
+      }
+      // `mov x3, x0; ...; br x3`: the register holding the call's own target
+      // is where the branch reads it from, not something passed to it.
+      if (slot == function.operands(function.op(opId))[0]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /// Trims one call's argument list to what the caller set up, and reports the
   /// gaps it could not trim.
-  static bool recoverArity(il::Function& function, il::OpId opId) {
+  static bool recoverArity(il::Function& function, il::OpId opId, std::size_t declared,
+                           const SlotSet& untouched,
+                           const std::unordered_set<uint32_t>& readElsewhere) {
     const auto operands = function.operands(function.op(opId));
-    if (operands.size() < 2) {
+    if (operands.size() <= kFirstArgOperand) {
       return false;  // target only: nothing was ever attached
     }
-    // Operand zero is the target, not an argument.
     const std::size_t attached = operands.size() - 1;
+    // Untouched slots are only told apart from forwarded ones where the caller
+    // is visibly building an argument list of its own: above the last slot it
+    // wrote. A call that writes none is a pure forwarder as far as this side
+    // can see (`(*env)->FindClass(env, name)`), and cutting it would lose
+    // arguments the callee really reads.
+    std::size_t lastWritten = 0;
+    for (std::size_t index = kFirstArgOperand; index <= attached; ++index) {
+      if (!untouched.contains({opId.index(), index}) &&
+          isSetUp(function, opId, index, operands[index], declared, untouched, readElsewhere)) {
+        lastWritten = index;
+      }
+    }
+    const SlotSet noUntouched;
+    const SlotSet& ambiguous = lastWritten == 0 ? noUntouched : untouched;
     std::size_t arity = 0;
     std::size_t gaps = 0;
-    for (std::size_t index = 1; index <= attached; ++index) {
-      if (isSetUp(function, operands[index])) {
+    for (std::size_t index = kFirstArgOperand; index <= attached; ++index) {
+      if (isSetUp(function, opId, index, operands[index], declared, ambiguous, readElsewhere)) {
         // Every unset slot before this one is a gap, now that something after
         // it turns out to be an argument.
         gaps += index - 1 - arity;

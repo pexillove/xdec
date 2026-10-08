@@ -38,7 +38,7 @@
 
 #include "xdec/binary/dyld_cache_metadata.h"
 #include "xdec/binary/image.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 #include "dyld_cache_format.h"
 #include "field_reader.h"

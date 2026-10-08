@@ -5,7 +5,9 @@
 // because Result appears on memory-read paths that run millions of times.
 //
 // Analysis failures use Result; broken internal invariants use XDEC_ASSERT.
-// Exceptions are reserved for allocation failure.
+// Exceptions are reserved for allocation failure and cancellation
+// (obs::CancelledError, converted back to a Result at API entry points -- see
+// support/stop.h).
 #pragma once
 
 #include <format>

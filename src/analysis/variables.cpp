@@ -792,7 +792,8 @@ void VariableTable::applyImportedTypes(const TypedVariables& typed,
     while (last + 1 < locals_.size() && locals_[last + 1].stackDelta < end) {
       const Variable& sibling = locals_[last + 1];
       const types::TypeDatabase::FieldPath field =
-          database.fieldAt(*found, static_cast<uint64_t>(sibling.stackDelta - base));
+          database.fieldAt(*found, static_cast<uint64_t>(sibling.stackDelta - base),
+                           sibling.type.width);
       if (!field.found() || field.remainder != 0 ||
           database.sizeOf(field.type).value_or(0) * 8 != sibling.type.width) {
         coversCleanly = false;
@@ -804,8 +805,9 @@ void VariableTable::applyImportedTypes(const TypedVariables& typed,
       continue;
     }
     for (std::size_t absorbed = index + 1; absorbed <= last; ++absorbed) {
-      const types::TypeDatabase::FieldPath field = database.fieldAt(
-          *found, static_cast<uint64_t>(locals_[absorbed].stackDelta - base));
+      const types::TypeDatabase::FieldPath field =
+          database.fieldAt(*found, static_cast<uint64_t>(locals_[absorbed].stackDelta - base),
+                           locals_[absorbed].type.width);
       std::string path;
       for (const std::string& name : field.names) {
         path += path.empty() ? name : "." + name;

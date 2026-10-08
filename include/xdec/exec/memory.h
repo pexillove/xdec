@@ -137,6 +137,15 @@ class GuestAddressSpace final : public il::ExecMemoryBackend {
       std::span<const MemoryPatch> patches) const;
   [[nodiscard]] Result<void> apply(std::span<const MemoryPatch> patches);
 
+  /// Overwrites already-resident pages covering [address, address+size) with
+  /// the page provider's current bytes. Missing pages are left alone: their
+  /// next access fetches them fresh anyway. This exists for memory the device
+  /// wrote outside anything the trace modelled -- a run-loop callout's Mach
+  /// message, delivered by the kernel while the guest was parked -- where a
+  /// page cached in an earlier phase would otherwise be read as if it were the
+  /// guest's own state. Without a provider it does nothing.
+  [[nodiscard]] Result<void> refresh(uint64_t address, uint64_t size);
+
   [[nodiscard]] std::vector<MemoryRange> dirtyRanges() const;
   void clearDirty() {
     dirtyBytes_.clear();

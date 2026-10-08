@@ -31,7 +31,7 @@
 #include <vector>
 
 #include "xdec/binary/image.h"
-#include "xdec/support/log.h"
+#include "xdec/obs/log.h"
 
 #include "field_reader.h"
 #include "macho_format.h"
@@ -691,11 +691,9 @@ class MachOLoader {
       XDEC_LOG_WARN(logBinary(), "'{}': malformed dyld_chained_fixups_header", path_);
       return;
     }
-    if (importsCount != 0 && importsFormat != kChainedImportFormatNormal) {
-      // Formats 2/3 add a separate addend field ahead of the same 4-byte
-      // header word; not implemented, so a bind here still gets a
-      // Relocation (the slot is still known to be a bind, not a rebase) but
-      // without a name attached.
+    if (importsCount != 0 && importsFormat != kChainedImportFormatNormal &&
+        importsFormat != kChainedImportFormatAddend &&
+        importsFormat != kChainedImportFormatAddend64) {
       XDEC_LOG_WARN(logBinary(),
                     "'{}': chained imports format {} is not decoded; bound symbols in this "
                     "image stay unnamed",
@@ -749,7 +747,14 @@ class MachOLoader {
                     path_, pointerFormat, segment.name);
       return;
     }
-    const uint64_t imageBase = segments_.empty() ? 0 : segments_.front().vmaddr;
+    // Mach-O executables commonly begin with a zero-filled __PAGEZERO whose
+    // vmaddr is 0. Chained-fixup segment offsets are relative to the mapped
+    // image (__TEXT), not to that guard region.
+    const auto mappedBase = std::find_if(segments_.begin(), segments_.end(),
+                                         [](const Segment& candidate) {
+                                           return candidate.filesize != 0;
+                                         });
+    const uint64_t imageBase = mappedBase == segments_.end() ? 0 : mappedBase->vmaddr;
     for (uint16_t page = 0; page < pageCount; ++page) {
       auto pageStart = static_cast<uint16_t>(
           reader_.u16(segInfoBase + kChainedSegPageStart + uint64_t{page} * 2));
@@ -771,8 +776,17 @@ class MachOLoader {
                       path_, page, segment.name);
         continue;
       }
-      walkChain(segment, segmentOffset + uint64_t{page} * pageSize, pageStart, pointerFormat,
-               imageBase);
+      // segment_offset is image-relative, not relative to this segment. Turn
+      // it into the offset within `segment` before combining it with that
+      // segment's fileoff/vmaddr in walkChain.
+      const uint64_t pageVa = imageBase + segmentOffset + uint64_t{page} * pageSize;
+      if (pageVa < segment.vmaddr || pageVa >= segment.vmaddr + segment.vmsize) {
+        XDEC_LOG_WARN(logBinary(),
+                      "'{}': fixup page {} does not lie in segment '{}'",
+                      path_, page, segment.name);
+        continue;
+      }
+      walkChain(segment, pageVa - segment.vmaddr, pageStart, pointerFormat, imageBase);
     }
   }
 
@@ -846,19 +860,41 @@ class MachOLoader {
     relocations_.push_back(relocation);
   }
 
-  /// `dyld_chained_import` (format 1) only -- see the warning in
-  /// applyChainedFixups for the addend-carrying formats 2/3.
   std::string resolveChainedImportName(uint32_t ordinal) {
-    if (imports_.format != kChainedImportFormatNormal || ordinal >= imports_.count) {
+    if (ordinal >= imports_.count) {
       return {};
     }
-    const uint64_t entry = imports_.importsOffset + uint64_t{ordinal} * 4;
-    const auto word = static_cast<uint32_t>(reader_.u32(imports_.header + entry));
+
+    uint64_t entrySize = 0;
+    uint32_t nameOffset = 0;
+    switch (imports_.format) {
+      case kChainedImportFormatNormal:
+        entrySize = 4;
+        [[fallthrough]];
+      case kChainedImportFormatAddend: {
+        if (entrySize == 0) {
+          entrySize = 8;
+        }
+        const uint64_t entry = imports_.importsOffset + uint64_t{ordinal} * entrySize;
+        const auto word = static_cast<uint32_t>(reader_.u32(imports_.header + entry));
+        nameOffset =
+            (word >> kChainedImportNameOffsetShift) & kChainedImportNameOffsetMask;
+        break;
+      }
+      case kChainedImportFormatAddend64: {
+        entrySize = 16;
+        const uint64_t entry = imports_.importsOffset + uint64_t{ordinal} * entrySize;
+        const uint64_t word = reader_.u64(imports_.header + entry);
+        nameOffset = static_cast<uint32_t>(word >> kChainedImport64NameOffsetShift);
+        break;
+      }
+      default:
+        return {};
+    }
     if (reader_.failed()) {
       reader_.clearFailure();
       return {};
     }
-    const uint32_t nameOffset = (word >> kChainedImportNameOffsetShift) & kChainedImportNameOffsetMask;
     const std::string_view name =
         reader_.cstring(imports_.header + imports_.symbolsOffset + nameOffset);
     if (reader_.failed()) {
